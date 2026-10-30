@@ -1,9 +1,16 @@
 from flask import Flask, request, jsonify
 import subprocess
 import hmac
-import math
+import json
+import logging
 import os
 import re
+import shutil
+
+import fetch
+import montage
+import taches
+from montage import a_du_son, duree_video, nombre
 
 app = Flask(__name__)
 
@@ -11,15 +18,25 @@ app = Flask(__name__)
 # Ce sera le point de montage de notre volume partagé
 BASE_DIR = os.environ.get("MEDIA_DIR", "/media")
 
-# Jeton d'accès facultatif : s'il est défini dans les variables d'environnement
-# (Coolify), chaque appel doit envoyer l'en-tête "Authorization: Bearer <jeton>"
+# Jeton d'accès : chaque appel envoie l'en-tête "Authorization: Bearer <jeton>".
+# Sans API_TOKEN défini (Coolify), tout est refusé, sauf les routes ouvertes.
 API_TOKEN = os.environ.get("API_TOKEN")
+
+# Le workflow de transcription n'envoie pas de jeton : ces deux routes restent ouvertes
+ROUTES_OUVERTES = {"split_audio", "get_duration"}
+
+# Un video_id entre dans des chemins de fichiers
+MOTIF_VIDEO = re.compile(r"[A-Za-z0-9_-]{11}")
+
+taches.reprendre()
 
 
 @app.before_request
 def verifier_jeton():
+    if request.endpoint in ROUTES_OUVERTES:
+        return None
     recu = request.headers.get("Authorization", "")
-    if API_TOKEN and not hmac.compare_digest(recu.encode(), f"Bearer {API_TOKEN}".encode()):
+    if not API_TOKEN or not hmac.compare_digest(recu.encode(), f"Bearer {API_TOKEN}".encode()):
         return jsonify({"error": "Unauthorized"}), 401
 
 
@@ -99,35 +116,6 @@ def get_duration():
         return jsonify({"duration_seconds": duration}), 200
     except (subprocess.CalledProcessError, ValueError) as e:
         return jsonify({"error": "Failed to get duration", "details": str(e)}), 500
-
-
-def nombre(valeur, minimum):
-    """Nombre fini >= minimum, sinon None (texte, null, NaN, négatif...)."""
-    if isinstance(valeur, bool):
-        return None
-    try:
-        x = float(valeur)
-    except (TypeError, ValueError):
-        return None
-    return x if math.isfinite(x) and x >= minimum else None
-
-
-def duree_video(chemin):
-    sortie = subprocess.run(
-        ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
-         '-of', 'default=noprint_wrappers=1:nokey=1', chemin],
-        check=True, capture_output=True, text=True, timeout=60,
-    ).stdout
-    return float(sortie.strip())
-
-
-def a_du_son(chemin):
-    sortie = subprocess.run(
-        ['ffprobe', '-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=index',
-         '-of', 'csv=p=0', chemin],
-        check=True, capture_output=True, text=True, timeout=60,
-    ).stdout
-    return bool(sortie.strip())
 
 
 def debut_avant_pic(chemin, longueur, avance=2):
@@ -219,19 +207,13 @@ def vertical():
 
         command = ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
                    '-ss', str(debut), '-t', str(longueur), '-i', input_file]
-        if son:
-            # Son du jeu gardé, volume harmonisé à -14 LUFS (niveau des plateformes)
-            # (loudnorm travaille en 192 kHz : on revient à 48 kHz, la norme vidéo)
-            audio = ";[0:a]loudnorm=I=-14:TP=-1.5,aresample=48000[a]"
-        else:
-            # Clip muet : piste silencieuse, certaines plateformes refusent une vidéo sans son
-            command += ['-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo']
-            audio = ";[1:a]anull[a]"
+        if not son:
+            command += montage.ENTREE_SILENCE
+        audio = montage.SON_NORMALISE if son else montage.SON_SILENCE
         command += [
-            '-filter_complex', FILTRES_VERTICAUX[mode] + audio,
+            '-filter_complex', FILTRES_VERTICAUX[mode] + ';' + audio,
             '-map', '[v]', '-map', '[a]', '-t', str(longueur),
-            '-r', '30', '-c:v', 'libx264', '-preset', 'medium', '-crf', '21',
-            '-c:a', 'aac', '-b:a', '160k', '-movflags', '+faststart', output_file,
+            *montage.ENCODAGE, output_file,
         ]
         subprocess.run(command, check=True, capture_output=True, text=True, timeout=600)
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError) as e:
@@ -249,6 +231,140 @@ def vertical():
         "duration": longueur,
         "mode": mode,
     }), 200
+
+
+def video_id_recu():
+    """video_id du corps JSON, ou None s'il est absent ou invalide."""
+    data = request.get_json(silent=True)
+    video_id = data.get('video_id') if isinstance(data, dict) else None
+    return video_id if isinstance(video_id, str) and MOTIF_VIDEO.fullmatch(video_id) else None
+
+
+def dossier_media(nom):
+    return os.path.join(os.path.realpath(BASE_DIR), nom)
+
+
+def chemin_brut(video_id):
+    return os.path.join(dossier_media("bruts"), f"{video_id}.mp4")
+
+
+def chemin_plan(video_id):
+    return os.path.join(dossier_media("plans"), f"{video_id}.json")
+
+
+def lire_plan(video_id):
+    with open(chemin_plan(video_id), encoding="utf-8") as fichier:
+        return json.load(fichier)
+
+
+def analyser_video(video_id):
+    """Plan de la vidéo : celui déjà écrit, sinon appel à Gemini puis tri."""
+    if os.path.isfile(chemin_plan(video_id)):
+        return lire_plan(video_id)
+    brut = chemin_brut(video_id)
+    if not os.path.isfile(brut):
+        raise FileNotFoundError(f"brut absent pour {video_id} : /fetch d'abord")
+    import analyse
+    import tri
+    plan = analyse.analyser(brut, video_id)
+    gardes, rejetes = tri.trier(plan["moments"])
+    plan["moments"], plan["rejetes"] = gardes, plan.get("rejetes", []) + rejetes
+    taches.ecrire_json(chemin_plan(video_id), plan)
+    return plan
+
+
+def chemin_cout_tache(id_tache):
+    return os.path.join(dossier_media("taches"), f"{id_tache}.cout.json")
+
+
+def recuperer_video(video_id):
+    """/fetch : un échec après paiement laisse son coût à côté de l'état de la tâche."""
+    try:
+        return fetch.recuperer(video_id, dossier_media("bruts"))
+    except fetch.ErreurFetch as e:
+        if e.cout_usd:
+            try:
+                taches.ecrire_json(chemin_cout_tache(taches.en_cours()), {"cout_usd": e.cout_usd})
+            except OSError as ecriture:
+                logging.getLogger(__name__).error("coût de la tâche non écrit : %s", ecriture)
+        raise
+
+
+def monter_moment(video_id, n):
+    if not os.path.isfile(chemin_plan(video_id)):
+        raise FileNotFoundError(f"plan absent pour {video_id} : /analyse d'abord")
+    moment = next((m for m in lire_plan(video_id)["moments"] if m.get("n") == n), None)
+    if moment is None:
+        raise ValueError(f"moment {n} absent du plan de {video_id}")
+    nom = f"{video_id}_{n}.mp4"
+    resultat = montage.monter(chemin_brut(video_id), moment, os.path.join(dossier_media("shorts"), nom))
+    return {"file_path": f"shorts/{nom}", **resultat}
+
+
+@app.route('/sante', methods=['GET'])
+def sante():
+    libre = shutil.disk_usage(os.path.realpath(BASE_DIR)).free
+    return jsonify({"disque_libre_go": round(libre / 1e9, 1), "tache_en_cours": taches.en_cours()}), 200
+
+
+@app.route('/taches/<id_tache>', methods=['GET'])
+def etat_tache(id_tache):
+    etat = taches.lire(id_tache)
+    if etat is None:
+        return jsonify({"error": "Unknown task"}), 404
+    if etat["etat"] == "echouee" and os.path.isfile(chemin_cout_tache(id_tache)):
+        with open(chemin_cout_tache(id_tache), encoding="utf-8") as fichier:
+            etat = {**etat, **json.load(fichier)}
+    return jsonify(etat), 200
+
+
+@app.route('/fetch', methods=['POST'])
+def lancer_fetch():
+    video_id = video_id_recu()
+    if video_id is None:
+        return jsonify({"error": "Invalid video_id"}), 400
+    return jsonify({"tache": taches.lancer(lambda: recuperer_video(video_id), video_id)}), 202
+
+
+@app.route('/analyse', methods=['POST'])
+def lancer_analyse():
+    video_id = video_id_recu()
+    if video_id is None:
+        return jsonify({"error": "Invalid video_id"}), 400
+    return jsonify({"tache": taches.lancer(lambda: analyser_video(video_id), video_id)}), 202
+
+
+@app.route('/monter', methods=['POST'])
+def lancer_montage():
+    video_id = video_id_recu()
+    if video_id is None:
+        return jsonify({"error": "Invalid video_id"}), 400
+    n = request.get_json().get('moment')
+    if not isinstance(n, int) or isinstance(n, bool):
+        return jsonify({"error": "moment must be an integer"}), 400
+    return jsonify({"tache": taches.lancer(lambda: monter_moment(video_id, n), video_id)}), 202
+
+
+@app.route('/nettoyer', methods=['POST'])
+def nettoyer():
+    video_id = video_id_recu()
+    if video_id is None:
+        return jsonify({"error": "Invalid video_id"}), 400
+    if taches.video_occupee(video_id):
+        return jsonify({"error": "A task is running on this video"}), 409
+
+    fichiers = [chemin_brut(video_id), chemin_brut(video_id) + ".part", chemin_plan(video_id),
+                fetch.chemin_suivi(dossier_media("bruts"), video_id)]
+    shorts = dossier_media("shorts")
+    motif = re.compile(re.escape(video_id) + r"_\d+\.mp4(\.part)?")
+    if os.path.isdir(shorts):
+        fichiers += [os.path.join(shorts, nom) for nom in os.listdir(shorts) if motif.fullmatch(nom)]
+    octets = 0
+    for fichier in fichiers:
+        if os.path.isfile(fichier):
+            octets += os.path.getsize(fichier)
+            os.remove(fichier)
+    return jsonify({"efface_mo": round(octets / 1e6, 1)}), 200
 
 
 if __name__ == '__main__':

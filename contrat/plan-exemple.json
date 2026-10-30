@@ -1,0 +1,26 @@
+{
+  "video_id": "_1PH44fjxNg",
+  "modele": "gemini-3.8-flash",
+  "titre_propose": "solo hunt that went sideways",
+  "description_proposee": "Full hunt, captured on PS5.",
+  "chasseur": "Anderson",
+  "cout_usd": 0.18,
+  "moments": [
+    {
+      "n": 1,
+      "debut_s": 412.5,
+      "fin_s": 424.0,
+      "registre": "maitrise",
+      "format": "instant",
+      "score": 8,
+      "monstre": "Rathalos",
+      "arme": "Long Sword",
+      "x_centre": 0.5,
+      "textes": [
+        {"texte": "parry diff", "debut_s": 1.0, "fin_s": 5.0}
+      ],
+      "autre": null
+    }
+  ],
+  "rejetes": []
+}
