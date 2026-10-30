@@ -58,8 +58,8 @@ def test_faststart(brut_modele, sortie):
 
 
 @pytest.mark.parametrize("taille,attendu", [
-    ((1920, 1072), (602, 1070, 658, 1)),
-    ((1920, 1080), (606, 1076, 656, 2)),
+    ((1920, 1072), (1072, 1072, 424, 0)),
+    ((1920, 1080), (1080, 1080, 420, 0)),
 ])
 def test_cadre_au_centre_tolere_1072_et_1080(taille, attendu):
     assert montage.cadre(*taille, 0.5) == attendu
@@ -67,14 +67,43 @@ def test_cadre_au_centre_tolere_1072_et_1080(taille, attendu):
 
 def test_cadre_borne_dans_l_image():
     assert montage.cadre(1920, 1080, 0)[2] == 0
-    assert montage.cadre(1920, 1080, 1)[2] == 1920 - 606
+    assert montage.cadre(1920, 1080, 1)[2] == 1920 - 1080
     assert montage.cadre(1920, 1080, 0.01)[2] == 0
-    assert montage.cadre(1920, 1080, 0.99)[2] == 1920 - 606
+    assert montage.cadre(1920, 1080, 0.99)[2] == 1920 - 1080
 
 
 def test_cadre_source_etroite():
     largeur, hauteur, x, y = montage.cadre(1080, 1920, 0.5)
-    assert (largeur, hauteur) == (1080, 1920) and (x, y) == (0, 0)
+    assert (largeur, hauteur) == (1080, 1080) and (x, y) == (0, 420)
+
+
+@pytest.mark.parametrize("hauteur_texte,attendu", [
+    (0, (420, 300)),       # sans texte : image centrée
+    (90, (420, 300)),      # texte court : il tient dans la bande
+    (130, (454, 300)),     # l'image descend sous le texte
+    (347, (560, 189)),     # trois lignes : le texte remonte, toujours dans la bande
+])
+def test_place_garde_le_texte_dans_la_bande(hauteur_texte, attendu):
+    assert montage.place(hauteur_texte) == attendu
+
+
+def test_image_placee_selon_le_texte_le_plus_haut(brut_modele, sortie, tmp_path, monkeypatch):
+    vues, vraie_place = [], montage.place
+    monkeypatch.setattr(montage, "place", lambda h: vues.append(h) or vraie_place(h))
+    long = "this is a much longer text to force the layout onto three whole lines on screen right now"
+    textes = [{"texte": "short", "debut_s": 0, "fin_s": 1}, {"texte": long, "debut_s": 1, "fin_s": 3}]
+    montage.monter(str(brut_modele), moment(textes=textes), str(sortie))
+    y_image, _ = vraie_place(vues[0])
+    assert y_image > montage.Y_IMAGE_MIN
+    i = image(sortie, 0.5, tmp_path / "i.png")  # texte court à l'écran : l'image reste plus bas
+    assert max(i.getpixel((100, y_image - 8))) < 20 and max(i.getpixel((100, y_image + 8))) > 60
+
+
+def test_bandes_noires_autour_de_l_image(brut_modele, sortie, tmp_path):
+    montage.monter(str(brut_modele), moment(), str(sortie))
+    i = image(sortie, 1, tmp_path / "i.png")
+    assert max(i.getpixel((540, 200))) < 20 and max(i.getpixel((540, 1700))) < 20
+    assert max(i.getpixel((540, 960))) > 60
 
 
 @pytest.mark.parametrize("x_centre,rouge", [(0, True), (1, False)])

@@ -1,4 +1,4 @@
-"""Montage d'un Short depuis un moment du plan : coupe, recadrage 9:16, son, textes.
+"""Montage d'un Short depuis un moment du plan : coupe, image carrée sur fond noir, son, textes.
 
 Pas de zoom ni d'effet : l'intérêt est dans le choix du moment et du texte.
 """
@@ -9,9 +9,15 @@ import subprocess
 import tempfile
 import time
 
+from PIL import Image
+
 import texte
 
 LARGEUR, HAUTEUR = 1080, 1920
+# Format validé le 31/10 : image 1:1, texte dans la bande noire du haut
+COTE_IMAGE = 1080
+Y_IMAGE_MIN, Y_IMAGE_MAX = 420, 560
+ECART_TEXTE = 24
 TEXTES_MAX = 3
 DELAI_RENDU_S = 1800
 
@@ -69,11 +75,17 @@ def dimensions(chemin):
 
 
 def cadre(largeur, hauteur, x_centre):
-    """Plus grand cadre 9:16 (largeur, hauteur, x, y) centré sur x_centre, dans l'image."""
-    l_cadre = min(largeur, hauteur * 9 // 16) // 2 * 2
-    h_cadre = min(hauteur, l_cadre * 16 // 9) // 2 * 2
-    x = max(0, min(round(x_centre * largeur - l_cadre / 2), largeur - l_cadre)) // 2 * 2
-    return l_cadre, h_cadre, x, (hauteur - h_cadre) // 2
+    """Plus grand carré (largeur, hauteur, x, y) centré sur x_centre, dans l'image."""
+    cote = min(largeur, hauteur) // 2 * 2
+    x = max(0, min(round(x_centre * largeur - cote / 2), largeur - cote)) // 2 * 2
+    return cote, cote, x, (hauteur - cote) // 2
+
+
+def place(hauteur_texte):
+    """(y de l'image, y du texte) : l'image laisse la place au texte, qui reste dans la bande."""
+    sous_le_texte = texte.HAUT + hauteur_texte + ECART_TEXTE
+    y_image = max(Y_IMAGE_MIN, min(sous_le_texte, Y_IMAGE_MAX)) // 2 * 2
+    return y_image, min(texte.HAUT, y_image - hauteur_texte - ECART_TEXTE)
 
 
 def horaires(textes, longueur):
@@ -103,13 +115,14 @@ def _bornes(moment, total):
     return debut, min(fin, total) - debut
 
 
-def _filtre_image(zone, incrustations, premiere_entree):
-    """Filtre vidéo : cadence, recadrage, puis chaque PNG à son instant.
+def _filtre_image(zone, y_image, incrustations, premiere_entree):
+    """Filtre vidéo : cadence, carré sur fond noir, puis chaque PNG à son instant.
 
     Fin exclue : la dernière image d'un texte n'est jamais la première du suivant.
     """
     l_cadre, h_cadre, x, y = zone
-    filtre = f"[0:v]fps=30,crop={l_cadre}:{h_cadre}:{x}:{y},scale={LARGEUR}:{HAUTEUR},setsar=1[i0]"
+    filtre = (f"[0:v]fps=30,crop={l_cadre}:{h_cadre}:{x}:{y},scale={COTE_IMAGE}:{COTE_IMAGE},setsar=1,"
+              f"pad={LARGEUR}:{HAUTEUR}:0:{y_image}:black[i0]")
     for i, (px, py, debut, fin) in enumerate(incrustations):
         filtre += (f";[i{i}][{premiere_entree + i}:v]"
                    f"overlay={px}:{py}:enable='gte(t,{debut})*lt(t,{fin})'[i{i + 1}]")
@@ -131,12 +144,18 @@ def monter(brut, moment, sortie):
     os.makedirs(os.path.dirname(sortie), exist_ok=True)
 
     with tempfile.TemporaryDirectory() as dossier:
-        entrees, incrustations = [], []
+        entrees, images = [], []
         for i, (chaine, debut_texte, fin_texte) in enumerate(textes):
             png = os.path.join(dossier, f"{i}.png")
-            incrustations.append((*texte.rendre(chaine, png), debut_texte, fin_texte))
+            px, _ = texte.rendre(chaine, png)
+            with Image.open(png) as rendu:
+                images.append((px, rendu.height, debut_texte, fin_texte))
             entrees += ['-i', png]
-        filtre = _filtre_image(zone, incrustations, 1 if son else 2) + ';' + (SON_NORMALISE if son else SON_SILENCE)
+        # L'image ne bouge pas de tout le clip : sa place dépend du texte le plus haut
+        y_image, y_texte = place(max((h for _, h, _, _ in images), default=0))
+        incrustations = [(px, y_texte, debut_texte, fin_texte) for px, _, debut_texte, fin_texte in images]
+        filtre = (_filtre_image(zone, y_image, incrustations, 1 if son else 2) + ';'
+                  + (SON_NORMALISE if son else SON_SILENCE))
         commande = ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
                     '-ss', str(debut), '-t', str(longueur), '-i', brut,
                     *([] if son else ENTREE_SILENCE), *entrees,
