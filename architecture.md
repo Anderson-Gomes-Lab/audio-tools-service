@@ -14,7 +14,7 @@ Un seul processus : le verrou des tâches et leur état en mémoire tiennent dan
 - `taches.py` : une tâche à la fois, état écrit de façon atomique, filtre des secrets dans les erreurs.
 - `fetch.py` : téléchargement par Apify, `.part` renommé une fois vérifié.
 - `analyse.py`, `tri.py`, `consigne.md` : choix des moments par Gemini.
-- `montage.py` : coupe, recadrage, son, incrustation ; porte les réglages communs avec `/vertical`.
+- `montage.py` : coupe, image carrée sur fond noir, son, incrustation ; porte les réglages communs avec `/vertical`.
 - `texte.py` : PNG des textes (Pillow), zone haute de l'écran.
 - `polices/` : Inter ExtraBold (licence OFL), figée depuis la police variable.
 - `tests/` : pytest, vidéos de synthèse fabriquées par ffmpeg, Apify et Gemini simulés.
@@ -23,7 +23,7 @@ Un seul processus : le verrou des tâches et leur état en mémoire tiennent dan
 ## Variables d'environnement
 `API_TOKEN` (routes de clips, sans lui tout est refusé), `APIFY_TOKEN`, `GEMINI_API_KEY`, `MEDIA_DIR` (facultative, `/media` par défaut).
 
-## Mesures (30/10/2026)
-Complexité max 15 (ruff C901). Fichiers ≤ 400 lignes.
+## Mesures (31/10/2026)
+Complexité max 15 (ruff C901), tenue. Fichiers ≤ 400 lignes ; le plus gros, `app.py`, en fait 391 : la route `/vertical`, que la chaîne n'appelle pas, est la première à retirer. 253 tests.
 Rendu d'un Short de 30 s depuis un AV1 1080p : environ 16 s sur le Mac de développement, à remesurer sur le VPS. Coupe exacte à l'image près, -14,5 LUFS.
 AV1 : le ffmpeg de Debian (bookworm et trixie) est construit avec `--enable-libdav1d` (vérifié dans `debian/rules`) ; image Docker non construite, pas de Docker sur le poste.
