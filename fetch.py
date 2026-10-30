@@ -24,6 +24,7 @@ import taches
 API = "https://api.apify.com/v2"
 ACTEUR = "api-ninja~youtube-video-downloader"
 ATTENTE_S = 10
+ELEMENT_FACTURE = "apify-default-dataset-item"
 DELAI_RUN_S = 1200
 PANNES_TOLEREES = 5  # le run est déjà payé : un trou réseau passager ne doit pas le perdre
 VIE_LIEN_S = 12 * 60  # marge sur les 15 min du lien
@@ -70,6 +71,20 @@ def _attendre_run(id_run, jeton):
             return run
         time.sleep(ATTENTE_S)
     raise ErreurFetch("run Apify trop long")
+
+
+def _cout_final(run, jeton):
+    """Coût du run : Apify facture l'élément livré quelques secondes après la fin du run."""
+    for _ in range(PANNES_TOLEREES):
+        comptes = run.get("chargedEventCounts")
+        if run["status"] != "SUCCEEDED" or comptes is None or comptes.get(ELEMENT_FACTURE):
+            break
+        time.sleep(ATTENTE_S)
+        try:
+            run = _apify("GET", f"/actor-runs/{run['id']}", jeton)["data"]
+        except requests.RequestException:
+            break
+    return run.get("usageTotalUsd") or 0
 
 
 def _erreur_apify(e):
@@ -140,7 +155,7 @@ def _demander_lien(video_id, jeton, fiche, suivi):
         _lancer_run(video_id, jeton, fiche, suivi)
     fin = _attendre_run(suivi["id_run"], jeton)
     if not suivi["compte"]:
-        suivi.update(du_usd=suivi["du_usd"] + (fin.get("usageTotalUsd") or 0), compte=True)
+        suivi.update(du_usd=suivi["du_usd"] + _cout_final(fin, jeton), compte=True)
         _ecrire_suivi(fiche, suivi)
     if fin["status"] != "SUCCEEDED":
         suivi["id_run"] = None  # rien à relire : le prochain essai relance

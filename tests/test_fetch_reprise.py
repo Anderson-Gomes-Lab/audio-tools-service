@@ -244,3 +244,8 @@ def test_run_perdu_compte_une_seule_fois_si_la_relance_echoue(apify, bruts, monk
     payes.append(fetch.recuperer(ID, str(bruts))["cout_usd"])
     assert apify.runs == 2
     assert round(sum(payes), 4) == 0.1424
+
+
+def test_cout_lu_apres_la_facturation_de_l_element(apify, bruts):
+    apify.factures_en_retard = 3  # le run est fini, Apify n'a pas encore facturé la vidéo livrée
+    assert fetch.recuperer(ID, str(bruts))["cout_usd"] == 0.0712

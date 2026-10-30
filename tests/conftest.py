@@ -7,6 +7,7 @@ import requests
 
 ID_VIDEO = "mcKcHx3qbFQ"
 LIEN_APIFY = "https://apify.dziura.online/te/x.mp4?sig=SECRET"
+ELEMENT_FACTURE = "apify-default-dataset-item"
 JETON_APIFY = "apify_api_jeton_de_test"
 
 
@@ -121,6 +122,7 @@ class FauxApify:
         self.pannes_dataset = 0
         self.lectures_dataset = 0
         self.runs = 0
+        self.factures_en_retard = 0  # sondes où le coût affiché n'a pas encore l'élément livré
 
     def request(self, methode, url, headers=None, json=None, timeout=None, params=None):
         assert timeout
@@ -131,7 +133,11 @@ class FauxApify:
         if "/actor-runs/" in url:
             self.sondes += 1
             statut = "RUNNING" if self.sondes == 1 else self.statut_run
-            return Reponse({"data": {"status": statut, "usageTotalUsd": 0.0712, "defaultDatasetId": "ds1"}})
+            run = {"id": "run1", "status": statut, "usageTotalUsd": 0.0712, "defaultDatasetId": "ds1"}
+            if self.factures_en_retard:
+                self.factures_en_retard -= 1
+                run.update(usageTotalUsd=0.05, chargedEventCounts={ELEMENT_FACTURE: 0})
+            return Reponse({"data": run})
         self.lectures_dataset += 1
         if self.pannes_dataset:
             self.pannes_dataset -= 1
