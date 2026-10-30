@@ -128,6 +128,17 @@ def test_monter_sans_plan(api, attendre, tmp_path, brut_modele):
     assert attendre(api("/monter", {"video_id": ID, "moment": 1}).get_json()["tache"])["etat"] == "echouee"
 
 
+def test_short_se_telecharge_avec_le_jeton(atelier, auth, tmp_path):
+    (tmp_path / "shorts").mkdir(exist_ok=True)
+    (tmp_path / "shorts" / f"{ID}_2.mp4").write_bytes(b"video")
+    client = atelier.app.test_client()
+    reponse = client.get(f"/shorts/{ID}/2", headers=auth)
+    assert (reponse.status_code, reponse.data, reponse.mimetype) == (200, b"video", "video/mp4")
+    assert client.get(f"/shorts/{ID}/2").status_code == 401
+    assert client.get(f"/shorts/{ID}/3", headers=auth).status_code == 404
+    assert client.get("/shorts/pas%20bon/2", headers=auth).status_code == 400
+
+
 def test_nettoyer_efface_tout_et_rien_que_ca(api, tmp_path):
     for dossier in ("bruts", "plans", "shorts"):
         (tmp_path / dossier).mkdir()

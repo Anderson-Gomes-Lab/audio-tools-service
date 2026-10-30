@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 import subprocess
 import hmac
 import json
@@ -353,6 +353,16 @@ def lancer_montage():
     if not isinstance(n, int) or isinstance(n, bool):
         return jsonify({"error": "moment must be an integer"}), 400
     return jsonify({"tache": taches.lancer(lambda: monter_moment(video_id, n), video_id)}), 202
+
+
+@app.route('/shorts/<video_id>/<int:n>', methods=['GET'])
+def telecharger_short(video_id, n):
+    if not MOTIF_VIDEO.fullmatch(video_id):
+        return jsonify({"error": "Invalid video_id"}), 400
+    chemin = os.path.join(dossier_media("shorts"), f"{video_id}_{n}.mp4")
+    if not os.path.isfile(chemin):
+        return jsonify({"error": "Short not found"}), 404
+    return send_file(chemin, mimetype="video/mp4", as_attachment=True)
 
 
 @app.route('/nettoyer', methods=['POST'])

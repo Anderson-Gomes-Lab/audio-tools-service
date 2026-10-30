@@ -6,6 +6,7 @@ Un seul processus : le verrou des tâches et leur état en mémoire tiennent dan
 ## Usages
 - `/split`, `/duration` : transcription audio (workflow n8n « Convertisseur Audio to Text », actif). Ouvertes sans jeton. Ne pas les casser.
 - `/vertical` : clip 9:16 simple.
+- `/shorts/<video_id>/<n>` : téléchargement d'un Short par n8n, qui ne voit pas `/media`.
 - Chaîne des clips (`docs/contrat-chaine.md`, seule référence) : `/sante`, `/fetch`, `/analyse`, `/monter`, `/nettoyer`, `/taches/<id>`.
 
 ## Fichiers
