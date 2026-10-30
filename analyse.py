@@ -20,6 +20,7 @@ import tri
 MODELE = "gemini-3.8-flash"
 CONSIGNE = Path(__file__).with_name("consigne.md")
 MARGE_S = 20
+APRES_PIC_MIN_S = 3  # 2 % des gagnants du marché finissent à moins de 2 s du pic (recherche 12 v4)
 FPS_PASSE_1 = 1
 FPS_PASSE_2 = 5
 RELANCES_JSON = 2
@@ -32,10 +33,11 @@ FIN_TARIF_REDUIT = date(2026, 12, 31)
 TARIF_REDUIT = (0.75, 3.75)  # $ par million de jetons : entrée, sortie
 TARIF_NORMAL = (1.50, 7.50)
 
-REGISTRES = ["maitrise", "rire", "tension", "spectacle", "detente", "info"]
-DUREES_S = {  # registre : (instant, séquence), chacun (min, max), recherche 12 v2
-    "maitrise": ((8, 15), (30, 60)), "rire": ((6, 12), (15, 30)), "tension": ((10, 20), (30, 90)),
-    "spectacle": ((8, 15), (20, 40)), "detente": ((6, 15), (15, 30)), "info": ((15, 30), (30, 60)),
+REGISTRES = tri.PRIORITE
+DUREES_S = {  # registre : (instant, séquence), chacun (min, max), recherche 12 v3
+    "rire": ((8, 20), (20, 40)), "curiosite": ((10, 25), (25, 45)), "spectacle": ((15, 30), (30, 45)),
+    "tension": ((12, 25), (30, 60)), "info": ((15, 30), (30, 60)), "detente": ((8, 20), (20, 30)),
+    "maitrise": ((12, 25), (30, 60)),
 }
 CHAMPS_MOMENT = ["n", "debut_s", "fin_s", "registre", "format", "score", "monstre",
                  "arme", "x_centre", "textes", "autre"]
@@ -236,7 +238,7 @@ def _temps_absolus(reponse, debut, fin):
 def _selon_le_registre(moment):
     """Rend le moment à la durée de son registre, ou None si le raccourcir perdrait le pic.
 
-    Le pic est à la fin : on rallonge ou on raccourcit par le début. Le format suit la durée réelle.
+    La fin ne bouge pas : on rallonge ou on raccourcit par le début. Le format suit la durée réelle.
     """
     instant, sequence = DUREES_S[moment["registre"]]
     fin = moment["fin_s"]
@@ -285,8 +287,11 @@ def _passe_2(client, fichier, consigne, moment, duree, facture):
     final = _selon_le_registre(cale) if cale else None
     if final is None:
         return None
+    # Rallongé après le calage sur le registre, pour ne pas manger le début du clip.
+    fin_clip = max(final["fin_s"], min(round(final["pic_s"] + APRES_PIC_MIN_S, 1), duree))
     clip_rendu = (cale["debut_s"], cale["fin_s"])
-    return {**final, "textes": _textes_du_clip(reponse["textes"], clip_rendu, final["debut_s"], final["fin_s"])}
+    return {**final, "fin_s": fin_clip,
+            "textes": _textes_du_clip(reponse["textes"], clip_rendu, final["debut_s"], fin_clip)}
 
 
 def _preciser(client, fichier, consigne, candidats, duree, facture):
@@ -316,9 +321,10 @@ def _analyser(client, fichier, video_id, duree, facture):
             moments.append(cale)
         else:
             hors_video.append({**moment, "raison": "hors vidéo"})
-    candidats, rejetes = tri.trier(moments)
+    plafond = tri.quota(duree)
+    candidats, rejetes = tri.trier(moments, plafond)
     precis, ecartes = _preciser(client, fichier, consigne_2, candidats, duree, facture)
-    gardes, rejetes_2 = tri.trier(precis)
+    gardes, rejetes_2 = tri.trier(precis, plafond)
     return {
         "video_id": video_id,
         "modele": MODELE,

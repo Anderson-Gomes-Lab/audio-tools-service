@@ -7,7 +7,6 @@ import pytest
 
 import analyse
 import montage
-import tri
 
 PLAN_EXEMPLE = json.loads((Path(__file__).parent.parent / "contrat" / "plan-exemple.json").read_text(encoding="utf-8"))
 CLE = "AIzaCLEDETEST123"
@@ -32,7 +31,7 @@ def passe_1(*moments):
 
 
 def passe_2(debut=98.0, fin=110.0, trouve=True):
-    return {"trouve": trouve, "debut_s": debut, "pic_s": fin - 1, "fin_s": fin, "x_centre": 0.4,
+    return {"trouve": trouve, "debut_s": debut, "pic_s": fin - 3, "fin_s": fin, "x_centre": 0.4,
             "textes": [{"texte": "parry diff", "debut_s": 1.0, "fin_s": 5.0}]}
 
 
@@ -209,39 +208,6 @@ def test_analyse_n_importe_pas_flask():
     assert "flask" not in Path(analyse.__file__).read_text(encoding="utf-8").lower()
 
 
-def test_tri_garde_les_deux_meilleurs_numerotes():
-    moments = [moment(0, 10, "rire", 7), moment(100, 110, "maitrise", 9), moment(200, 210, "info", 8)]
-    gardes, rejetes = tri.trier(moments)
-    assert [(m["n"], m["registre"]) for m in gardes] == [(1, "maitrise"), (2, "info")]
-    assert [m["raison"] for m in rejetes] == ["quota"]
-
-
-def test_tri_seuil_de_score():
-    assert tri.trier([moment(0, 10, score=tri.SCORE_SEUIL)])[0]
-    gardes, rejetes = tri.trier([moment(0, 10, score=tri.SCORE_SEUIL - 1)])
-    assert gardes == [] and rejetes[0]["raison"] == "score"
-
-
-def test_tri_un_seul_par_registre():
-    gardes, rejetes = tri.trier([moment(0, 10, score=9), moment(100, 110, score=8)])
-    assert len(gardes) == 1 and rejetes[0]["raison"] == "registre"
-
-
-@pytest.mark.parametrize("debut, garde", [(30, True), (29, False), (5, False)])
-def test_tri_ecart_minimum(debut, garde):
-    gardes, rejetes = tri.trier([moment(0, 10, "rire", 9), moment(debut, debut + 8, "maitrise", 8)])
-    assert len(gardes) == (2 if garde else 1)
-    assert garde or rejetes[0]["raison"] == "ecart"
-
-
-def test_tri_accepte_zero_et_ne_modifie_pas_son_entree():
-    assert tri.trier([]) == ([], [])
-    entree = [moment(0, 10)]
-    copie = json.loads(json.dumps(entree))
-    tri.trier(entree)
-    assert entree == copie
-
-
 def ecrit(debut, fin, mot="parry diff"):
     return {"texte": mot, "debut_s": debut, "fin_s": fin}
 
@@ -267,11 +233,11 @@ def test_textes_toujours_montables(gemini, recus, attendus):
 
 
 @pytest.mark.parametrize("registre, rendu, fin, debut, format_reel", [
-    ("maitrise", 106, 110, 102, "instant"), ("maitrise", 129, 140, 129, "instant"),  # rallongé, gardé
-    ("rire", 100, 400, 370, "sequence"), ("rire", 100, 113, 101, "instant"), ("maitrise", 100, 122, 107, "instant"),
-    ("maitrise", 100, 200, 140, "sequence"), ("tension", 100, 200, 110, "sequence"),
-    ("spectacle", 100, 160, 120, "sequence"), ("detente", 100, 140, 110, "sequence"),
-    ("info", 100, 170, 110, "sequence"),
+    ("maitrise", 106, 110, 98, "instant"), ("maitrise", 126, 140, 126, "instant"),  # rallongé, gardé
+    ("rire", 100, 400, 360, "sequence"), ("rire", 100, 113, 100, "instant"), ("maitrise", 100, 127, 102, "instant"),
+    ("maitrise", 100, 200, 140, "sequence"), ("tension", 100, 200, 140, "sequence"),
+    ("spectacle", 100, 160, 115, "sequence"), ("detente", 100, 140, 110, "sequence"),
+    ("info", 100, 170, 110, "sequence"), ("curiosite", 100, 160, 115, "sequence"),
 ])
 def test_duree_par_registre_et_format(gemini, registre, rendu, fin, debut, format_reel):
     m = plan_avec(gemini, [], float(rendu), float(fin), registre)[0]
@@ -284,10 +250,42 @@ def test_raccourcir_ne_coupe_jamais_le_pic(gemini):
     assert plan["moments"] == [] and plan["rejetes"][0]["raison"] == "passe 2"
 
 
+def test_la_fin_laisse_retomber_l_action(gemini):
+    gemini(passe_1(moment(100, 120, "spectacle")), {**passe_2(100.0, 120.0), "pic_s": 119.5})
+    m = analyse.analyser("v.mp4", "abc")["moments"][0]
+    assert m["fin_s"] == 122.5 and m["debut_s"] == 100.0
+
+
+def test_une_fin_plus_tardive_que_le_minimum_est_gardee(gemini):
+    gemini(passe_1(moment(100, 120, "spectacle")), {**passe_2(100.0, 128.0), "pic_s": 120.0})
+    assert analyse.analyser("v.mp4", "abc")["moments"][0]["fin_s"] == 128.0
+
+
+def test_la_fin_s_arrete_a_la_fin_de_la_video(gemini, monkeypatch):
+    gemini(passe_1(moment(100, 118, "spectacle")), {**passe_2(100.0, 118.0), "pic_s": 117.5})
+    monkeypatch.setattr(analyse, "_duree", lambda chemin: 119.0)
+    assert analyse.analyser("v.mp4", "abc")["moments"][0]["fin_s"] == 119.0
+
+
+def test_rallonger_la_fin_garde_le_debut_et_l_accroche(gemini):
+    gemini(passe_1(moment(100, 130, "detente")),
+           {**passe_2(100.0, 130.0), "pic_s": 129.5, "textes": [ecrit(0.5, 3.0)]})
+    m = analyse.analyser("v.mp4", "abc")["moments"][0]
+    assert (m["debut_s"], m["fin_s"]) == (100.0, 132.5) and m["textes"] == [ecrit(0.5, 3.0)]
+
+
+def test_l_analyse_applique_le_quota(gemini):
+    faux = gemini(passe_1(moment(100, 120), moment(200, 220), moment(300, 320)),
+                  passe_2(100.0, 120.0), passe_2(200.0, 220.0))
+    plan = analyse.analyser("v.mp4", "abc")
+    assert [m["n"] for m in plan["moments"]] == [1, 2]
+    assert [r["raison"] for r in plan["rejetes"]] == ["quota"] and len(faux.appels) == 3
+
+
 def test_recadrer_garde_l_instant_reel_des_textes(gemini):
-    assert plan_avec(gemini, [ecrit(1.0, 2.0)], 106.0, 110.0)[0]["textes"] == [ecrit(5.0, 6.0)]  # rallongé de 4 s
-    m = plan_avec(gemini, [ecrit(1.0, 5.0), ecrit(35.0, 40.0)], 100.0, 160.0, "rire")[0]  # 30 s retirées
-    assert m["textes"] == [ecrit(5.0, 10.0)]
+    assert plan_avec(gemini, [ecrit(1.0, 2.0)], 106.0, 110.0)[0]["textes"] == [ecrit(9.0, 10.0)]  # rallongé de 8 s
+    m = plan_avec(gemini, [ecrit(1.0, 5.0), ecrit(35.0, 40.0)], 100.0, 160.0, "rire")[0]  # 20 s retirées
+    assert m["textes"] == [ecrit(15.0, 20.0)]
 
 
 def test_consignes_et_plafonds():
@@ -373,7 +371,7 @@ def service(atelier, auth, attendre, gemini, monkeypatch, tmp_path, brut_modele)
 def test_branchement_app_analyse_tri_montage(service, gemini, tmp_path):
     gemini(passe_1(moment(1, 2, "rire", 3), moment(2, 10)), passe_2(debut=2.0, fin=10.0))
     plan = service("/analyse")["resultat"]
-    assert [(m["n"], m["debut_s"], m["fin_s"]) for m in plan["moments"]] == [(1, 2.0, 10.0)]
+    assert [(m["n"], m["debut_s"], m["fin_s"]) for m in plan["moments"]] == [(1, 0.0, 10.0)]
     assert [r["raison"] for r in plan["rejetes"]] == ["score"]
     assert json.loads((tmp_path / "plans" / f"{ID}.json").read_text(encoding="utf-8")) == plan
     assert service("/monter", moment=1)["etat"] == "reussie"
