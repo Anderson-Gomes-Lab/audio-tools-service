@@ -266,10 +266,16 @@ def analyser_video(video_id):
         raise FileNotFoundError(f"brut absent pour {video_id} : /fetch d'abord")
     import analyse
     import tri
-    plan = analyse.analyser(brut, video_id)
-    gardes, rejetes = tri.trier(plan["moments"])
-    plan["moments"], plan["rejetes"] = gardes, plan.get("rejetes", []) + rejetes
-    taches.ecrire_json(chemin_plan(video_id), plan)
+    cout = 0
+    try:
+        plan = analyse.analyser(brut, video_id)
+        cout = plan["cout_usd"]
+        gardes, rejetes = tri.trier(plan["moments"])
+        plan["moments"], plan["rejetes"] = gardes, plan.get("rejetes", []) + rejetes
+        taches.ecrire_json(chemin_plan(video_id), plan)
+    except Exception as e:
+        noter_cout(getattr(e, "cout_usd", cout))
+        raise
     return plan
 
 
@@ -277,16 +283,20 @@ def chemin_cout_tache(id_tache):
     return os.path.join(dossier_media("taches"), f"{id_tache}.cout.json")
 
 
+def noter_cout(cout):
+    """Un échec après paiement laisse son coût à côté de l'état de la tâche."""
+    if cout:
+        try:
+            taches.ecrire_json(chemin_cout_tache(taches.en_cours()), {"cout_usd": cout})
+        except OSError as ecriture:
+            logging.getLogger(__name__).error("coût de la tâche non écrit : %s", ecriture)
+
+
 def recuperer_video(video_id):
-    """/fetch : un échec après paiement laisse son coût à côté de l'état de la tâche."""
     try:
         return fetch.recuperer(video_id, dossier_media("bruts"))
     except fetch.ErreurFetch as e:
-        if e.cout_usd:
-            try:
-                taches.ecrire_json(chemin_cout_tache(taches.en_cours()), {"cout_usd": e.cout_usd})
-            except OSError as ecriture:
-                logging.getLogger(__name__).error("coût de la tâche non écrit : %s", ecriture)
+        noter_cout(e.cout_usd)
         raise
 
 
