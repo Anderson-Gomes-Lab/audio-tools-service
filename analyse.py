@@ -1,4 +1,7 @@
-"""Analyse d'une chasse par Gemini : rend le plan JSON de contrat/plan-exemple.json."""
+"""Appels à Gemini : gardes de coût, fichier distant, et précision des moments pour le montage.
+
+La chaîne de lecture est dans lecture.py. `_preciser` n'a plus d'appelant : il revient au lot 2, avec le plan.
+"""
 
 import json
 import logging
@@ -6,32 +9,33 @@ import math
 import os
 import re
 import time
-from datetime import date
+from contextlib import contextmanager
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from google import genai
-from google.genai import types
+from google.genai import errors, types
 
 import montage
 import taches
 import texte
 import tri
+from tarifs import MODELE, MODELE_IDENTIFICATION, _cout, limite_video  # noqa: F401 (lecture.py les lit ici)
 
-MODELE = "gemini-3.8-flash"
 CONSIGNE = Path(__file__).with_name("consigne.md")
 MARGE_S = 20
 APRES_PIC_MIN_S = 3  # 2 % des gagnants du marché finissent à moins de 2 s du pic (recherche 12 v4)
-FPS_PASSE_1 = 1
 FPS_PASSE_2 = 5
 RELANCES_JSON = 2
 TOLERANCE_ARRONDI_S = 1  # MM:SS arrondit la fin de vidéo à la seconde pleine
 ATTENTE_FICHIER_S = 900
 PAUSE_FICHIER_S = 5
 DELAI_APPEL_MS = 600_000
+RELANCES_RESEAU = types.HttpRetryOptions(  # 5, 10, 20 puis 40 s : de quoi passer une minute saturée
+    attempts=5, initial_delay=5.0, max_delay=60.0, http_status_codes=[429, 500, 502, 503, 504])
 
-FIN_TARIF_REDUIT = date(2026, 12, 31)
-TARIF_REDUIT = (0.75, 3.75)  # $ par million de jetons : entrée, sortie
-TARIF_NORMAL = (1.50, 7.50)
+VIE_FICHIER = timedelta(hours=46)  # Gemini l'efface seul à 48 h ; 2 h de marge, comptées depuis le début de l'envoi
+FICHIER_PERDU = (403, 404)  # toute autre erreur de Gemini est passagère : le fichier est peut-être toujours là
 
 REGISTRES = tri.PRIORITE
 DUREES_S = {  # registre : (instant, séquence), chacun (min, max), recherche 12 v3
@@ -55,32 +59,6 @@ _TEXTE = {
     },
 }
 _TEXTES = {"type": "ARRAY", "items": _TEXTE, "maxItems": montage.TEXTES_MAX}
-_MOMENT = {
-    "type": "OBJECT",
-    "required": ["debut", "pic", "fin", "registre", "format", "score", "textes", "preuve"],
-    "properties": {
-        "debut": {"type": "STRING"},
-        "pic": {"type": "STRING"},
-        "fin": {"type": "STRING"},
-        "registre": {"type": "STRING", "enum": REGISTRES},
-        "format": {"type": "STRING", "enum": ["instant", "sequence"]},
-        "score": {"type": "INTEGER"},
-        "monstre": {"type": "STRING", "nullable": True},
-        "arme": {"type": "STRING", "nullable": True},
-        "textes": _TEXTES,
-        "preuve": {"type": "STRING"},
-        "autre": {"type": "STRING", "nullable": True},
-    },
-}
-SCHEMA_PASSE_1 = {
-    "type": "OBJECT",
-    "required": ["titre_propose", "description_proposee", "moments"],
-    "properties": {
-        "titre_propose": {"type": "STRING"},
-        "description_proposee": {"type": "STRING"},
-        "moments": {"type": "ARRAY", "items": _MOMENT},
-    },
-}
 SCHEMA_PASSE_2 = {
     "type": "OBJECT",
     "required": ["trouve", "debut_s", "pic_s", "fin_s", "x_centre", "textes"],
@@ -96,33 +74,82 @@ SCHEMA_PASSE_2 = {
 
 
 class ErreurAnalyse(RuntimeError):
-    """Échec de l'analyse. Message sans secret. cout_usd : tout ce qui a été facturé avant l'échec."""
+    """Échec de l'analyse. Message sans secret. cout_usd : ce que cet échec révèle à n8n."""
 
     cout_usd = 0
 
 
+class BrutRequis(ErreurAnalyse):
+    """Rien à lire : n8n refait /fetch puis /analyse, note gardée. Le message commence toujours par `brut_requis:`."""
+
+
+def _chemin_compteur():
+    return os.path.join(os.environ.get("MEDIA_DIR", "/media"), "compteur-gemini.json")
+
+
+def _depense_du_mois():
+    try:
+        with open(_chemin_compteur(), encoding="utf-8") as fichier:
+            compteur = json.load(fichier)
+    except FileNotFoundError:
+        return 0.0
+    return compteur["usd"] if compteur["mois"] == date.today().strftime("%Y-%m") else 0.0
+
+
 class _Facture:
-    """Cumule chaque appel facturé, y compris ceux qui finissent en échec."""
+    """Cumule chaque appel facturé, y compris ceux qui finissent en échec, et tient le compteur du mois.
 
-    def __init__(self):
+    `duree_s` : durée de la vidéo, d'où sa limite. Sans durée, pas de limite par vidéo.
+    `suivi` : son relevé (voir reprise.py), qui porte la dépense d'un essai à l'autre. `usd` ne compte que cet essai.
+    """
+
+    def __init__(self, duree_s=None, suivi=None):
         self.usd = 0.0
+        self.suivi = suivi
+        self.avant_usd = suivi.cout_usd if suivi else 0.0
+        self.limite_usd = math.inf if duree_s is None else limite_video(duree_s, date.today())
 
-    def noter(self, usage):
-        self.usd += _cout(usage, date.today())
+    def verifier(self):
+        """Refuse avant de dépenser. Un appel déjà parti reste compté : il franchit la limite, le suivant s'arrête."""
+        engage = self.avant_usd + self.usd
+        if engage >= self.limite_usd:
+            raise ErreurAnalyse(f"arrêt : {_dollars(engage)} engagés, limite de {_dollars(self.limite_usd)} "
+                                "pour cette vidéo")
+        plafond = os.environ.get("PLAFOND_GEMINI_MOIS_USD")  # sans lui, le compteur compte sans bloquer
+        if plafond and _depense_du_mois() >= float(plafond):
+            raise ErreurAnalyse(f"plafond Gemini du mois atteint : {_dollars(_depense_du_mois())} sur "
+                                f"{_dollars(float(plafond))}, {_dollars(engage)} engagés sur cette vidéo")
+
+    def noter(self, usage, modele=MODELE):
+        cout = _cout(usage, date.today(), modele)
+        self.usd += cout
+        if self.suivi:
+            self.suivi.payer(cout)
+        taches.ecrire_json(_chemin_compteur(), {"mois": date.today().strftime("%Y-%m"),
+                                                "usd": _depense_du_mois() + cout})
+
+    def revele(self):
+        """Ce qu'un échec annonce : sans suivi, cet essai ; avec, tout ce qu'aucune tâche n'a encore annoncé."""
+        return self.suivi.annoncer() if self.suivi else round(self.usd, 6)
+
+
+@contextmanager
+def facturation(facture):
+    """Toute erreur sort en ErreurAnalyse, sans secret, avec le coût déjà engagé."""
+    try:
+        yield
+    except Exception as erreur:
+        echec = erreur if isinstance(erreur, ErreurAnalyse) else ErreurAnalyse(_sans_secret(erreur))
+        echec.cout_usd = facture.revele()
+        raise echec from None
+
+
+def _dollars(montant):
+    return f"{montant:.2f} $".replace(".", ",")
 
 
 def _sans_secret(erreur):
     return f"{type(erreur).__name__}: {taches.sans_secret(str(erreur))}"
-
-
-def _tarif(jour):
-    return TARIF_REDUIT if jour <= FIN_TARIF_REDUIT else TARIF_NORMAL
-
-
-def _cout(usage, jour):
-    entree, sortie = _tarif(jour)
-    jetons_sortie = (usage.candidates_token_count or 0) + (usage.thoughts_token_count or 0)
-    return ((usage.prompt_token_count or 0) * entree + jetons_sortie * sortie) / 1_000_000
 
 
 def _consignes():
@@ -131,11 +158,14 @@ def _consignes():
     return passe_1.strip(), passe_2.strip()
 
 
-def _duree(chemin):
-    return montage.duree_video(chemin)
+def client():
+    cle = os.environ.get("GEMINI_API_KEY")
+    if not cle:
+        raise ErreurAnalyse("GEMINI_API_KEY absente")
+    return genai.Client(api_key=cle, http_options=types.HttpOptions(retry_options=RELANCES_RESEAU))
 
 
-def _attendre_traitement(client, fichier):
+def attendre_traitement(client_gemini, fichier):
     limite = time.monotonic() + ATTENTE_FICHIER_S
     while fichier.state is None or fichier.state.name != "ACTIVE":
         if fichier.state is not None and fichier.state.name == "FAILED":
@@ -143,8 +173,50 @@ def _attendre_traitement(client, fichier):
         if time.monotonic() > limite:
             raise ErreurAnalyse("Gemini n'a pas fini de traiter la vidéo à temps")
         time.sleep(PAUSE_FICHIER_S)
-        fichier = client.files.get(name=fichier.name)
+        fichier = client_gemini.files.get(name=fichier.name)
     return fichier
+
+
+def _fichier_vivant(client_gemini, chemin_memoire):
+    """Le fichier déjà envoyé, s'il n'est pas périmé et que Gemini l'a encore ; sinon None.
+
+    Une panne passagère sort en erreur : elle ne dit rien du fichier, et ne doit pas demander de /fetch.
+    """
+    try:
+        with open(chemin_memoire, encoding="utf-8") as fichier:
+            memoire = json.load(fichier)
+    except FileNotFoundError:
+        return None
+    if datetime.now(timezone.utc) - datetime.fromisoformat(memoire["date"]) >= VIE_FICHIER:
+        return None
+    try:
+        distant = client_gemini.files.get(name=memoire["nom"])
+    except errors.APIError as erreur:
+        if erreur.code not in FICHIER_PERDU:
+            raise
+        journal.warning("fichier Gemini perdu : %s", _sans_secret(erreur))
+        return None
+    return distant if distant.state is not None and distant.state.name == "ACTIVE" else None
+
+
+def fichier_disponible(client_gemini, brut, chemin_memoire):
+    """Le fichier distant s'il vit encore, None si le brut peut le remplacer. Sans l'un ni l'autre : BrutRequis."""
+    distant = _fichier_vivant(client_gemini, chemin_memoire)
+    if distant is None and not os.path.isfile(brut):
+        raise BrutRequis("brut_requis: fichier Gemini perdu ou périmé et brut absent, /fetch (0,13 $) puis /analyse")
+    return distant
+
+
+def fichier_gemini(client_gemini, brut, chemin_memoire):
+    """Réutilise le fichier distant, sinon renvoie le brut. Rien n'est effacé : la 2e passe en a besoin."""
+    distant = fichier_disponible(client_gemini, brut, chemin_memoire)
+    if distant is not None:
+        return distant
+    debut = datetime.now(timezone.utc)  # l'horloge de Gemini part de l'envoi, pas de la fin du traitement
+    envoi = client_gemini.files.upload(file=brut, config={"mime_type": "video/mp4"})
+    distant = attendre_traitement(client_gemini, envoi)
+    taches.ecrire_json(chemin_memoire, {"nom": distant.name, "date": debut.isoformat()})
+    return distant
 
 
 def _de_la_forme(valeur, schema):
@@ -171,24 +243,20 @@ def _lire(reponse):
         return None
 
 
-def _appeler(client, fichier, consigne, schema, metadonnees, resolution, facture):
+def generer(client_gemini, modele, contenu, schema, facture, resolution=None, reflexion=None):
     """Rend le JSON de la forme attendue. Les réponses mal formées sont facturées, donc notées aussi."""
-    video = types.Part(
-        file_data=types.FileData(file_uri=fichier.uri, mime_type=fichier.mime_type),
-        video_metadata=types.VideoMetadata(**metadonnees),
-    )
     config = types.GenerateContentConfig(
         response_mime_type="application/json",
         response_schema=schema,
         media_resolution=resolution,
+        thinking_config=types.ThinkingConfig(thinking_level=reflexion) if reflexion else None,
         http_options=types.HttpOptions(timeout=DELAI_APPEL_MS),
     )
     for _ in range(1 + RELANCES_JSON):
-        reponse = client.models.generate_content(
-            model=MODELE, contents=[video, types.Part(text=consigne)], config=config,
-        )
+        facture.verifier()
+        reponse = client_gemini.models.generate_content(model=modele, contents=contenu, config=config)
         if reponse.usage_metadata:
-            facture.noter(reponse.usage_metadata)
+            facture.noter(reponse.usage_metadata, modele)
         lu = _lire(reponse)
         if _de_la_forme(lu, schema):
             return lu
@@ -196,16 +264,28 @@ def _appeler(client, fichier, consigne, schema, metadonnees, resolution, facture
     raise ErreurAnalyse(f"JSON Gemini mal formé après {RELANCES_JSON} relances")
 
 
-def _secondes(temps):
-    """Convertit "MM:SS" en secondes ; -1 si Gemini a rendu autre chose."""
-    trouve = re.fullmatch(r"(\d{1,3}):([0-5]\d)", temps.strip())
-    return int(trouve[1]) * 60 + int(trouve[2]) if trouve else -1.0
+def partie_video(fichier, **metadonnees):
+    return types.Part(
+        file_data=types.FileData(file_uri=fichier.uri, mime_type=fichier.mime_type),
+        video_metadata=types.VideoMetadata(**metadonnees),
+    )
 
 
-def _en_secondes(moment):
-    """En passe 1, Gemini confond parfois 04:05 et 405 s s'il écrit des secondes : il écrit MM:SS, on convertit."""
-    return {**moment, "debut_s": _secondes(moment["debut"]), "pic_s": _secondes(moment["pic"]),
-            "fin_s": _secondes(moment["fin"])}
+def _appeler(client_gemini, fichier, consigne, schema, metadonnees, resolution, facture):
+    contenu = [partie_video(fichier, **metadonnees), types.Part(text=consigne)]
+    return generer(client_gemini, MODELE, contenu, schema, facture, resolution)
+
+
+def secondes(temps):
+    """Convertit "MM:SS", "H:MM:SS" ou "MM:SS.s" en secondes ; -1 si Gemini a rendu autre chose.
+
+    Au-delà d'une heure, nos consignes écrivent "61:40" ; Gemini peut répondre "1:01:40".
+    """
+    trouve = re.fullmatch(r"(?:(\d{1,2}):)?(\d{1,3}):([0-5]\d(?:\.\d+)?)", temps.strip())
+    if not trouve or (trouve[1] and int(trouve[2]) > 59):
+        return -1.0
+    total = int(trouve[1] or 0) * 3600 + int(trouve[2]) * 60 + float(trouve[3])
+    return int(total) if total == int(total) else total
 
 
 def _dans_la_video(moment, duree):
@@ -214,11 +294,6 @@ def _dans_la_video(moment, duree):
         return None
     borne = {**moment, "fin_s": min(moment["fin_s"], duree)}
     return borne if 0 <= borne["debut_s"] < borne["fin_s"] else None
-
-
-def _passe_1(client, fichier, consigne, facture):
-    return _appeler(client, fichier, consigne, SCHEMA_PASSE_1, {"fps": FPS_PASSE_1},
-                    types.MediaResolution.MEDIA_RESOLUTION_LOW, facture)
 
 
 def _temps_absolus(reponse, debut, fin):
@@ -309,53 +384,3 @@ def _preciser(client, fichier, consigne, candidats, duree, facture):
 def _conforme(moment):
     """Réduit un moment gardé aux champs du contrat."""
     return {champ: moment.get(champ) for champ in CHAMPS_MOMENT}
-
-
-def _analyser(client, fichier, video_id, duree, facture):
-    consigne_1, consigne_2 = _consignes()
-    brut = _passe_1(client, fichier, consigne_1, facture)
-    moments, hors_video = [], []
-    for moment in map(_en_secondes, brut["moments"]):
-        cale = _dans_la_video(moment, duree)
-        if cale:
-            moments.append(cale)
-        else:
-            hors_video.append({**moment, "raison": "hors vidéo"})
-    plafond = tri.quota(duree)
-    candidats, rejetes = tri.trier(moments, plafond)
-    precis, ecartes = _preciser(client, fichier, consigne_2, candidats, duree, facture)
-    gardes, rejetes_2 = tri.trier(precis, plafond)
-    return {
-        "video_id": video_id,
-        "modele": MODELE,
-        "titre_propose": brut["titre_propose"],
-        "description_proposee": brut["description_proposee"],
-        "cout_usd": round(facture.usd, 6),
-        "moments": [_conforme(m) for m in gardes],
-        "rejetes": hors_video + rejetes + ecartes + rejetes_2,
-    }
-
-
-def analyser(chemin_video: str, video_id: str) -> dict:
-    """Analyse une vidéo locale et rend son plan. Efface toujours le fichier distant."""
-    cle = os.environ.get("GEMINI_API_KEY")
-    if not cle:
-        raise ErreurAnalyse("GEMINI_API_KEY absente")
-    client = genai.Client(api_key=cle)
-    fichier = None
-    facture = _Facture()
-    try:
-        duree = _duree(chemin_video)
-        fichier = client.files.upload(file=chemin_video, config={"mime_type": "video/mp4"})
-        fichier = _attendre_traitement(client, fichier)
-        return _analyser(client, fichier, video_id, duree, facture)
-    except Exception as erreur:
-        echec = erreur if isinstance(erreur, ErreurAnalyse) else ErreurAnalyse(_sans_secret(erreur))
-        echec.cout_usd = round(facture.usd, 6)
-        raise echec from None
-    finally:
-        if fichier is not None:
-            try:
-                client.files.delete(name=fichier.name)
-            except Exception as erreur:
-                journal.warning("fichier distant non effacé : %s", _sans_secret(erreur))

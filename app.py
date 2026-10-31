@@ -14,8 +14,7 @@ from montage import a_du_son, duree_video, nombre
 
 app = Flask(__name__)
 
-# On définit le dossier de base où se trouvent nos fichiers
-# Ce sera le point de montage de notre volume partagé
+# Le dossier de base de nos fichiers : le point de montage de notre volume partagé
 BASE_DIR = os.environ.get("MEDIA_DIR", "/media")
 
 # Jeton d'accès : chaque appel envoie l'en-tête "Authorization: Bearer <jeton>".
@@ -252,31 +251,15 @@ def chemin_plan(video_id):
     return os.path.join(dossier_media("plans"), f"{video_id}.json")
 
 
-def lire_plan(video_id):
-    with open(chemin_plan(video_id), encoding="utf-8") as fichier:
-        return json.load(fichier)
-
-
-def analyser_video(video_id):
-    """Plan de la vidéo : celui déjà écrit, sinon appel à Gemini puis tri."""
-    if os.path.isfile(chemin_plan(video_id)):
-        return lire_plan(video_id)
-    brut = chemin_brut(video_id)
-    if not os.path.isfile(brut):
-        raise FileNotFoundError(f"brut absent pour {video_id} : /fetch d'abord")
-    import analyse
-    import tri
-    cout = 0
+def lire_video(video_id, remarque=False):
+    """/analyse, ou /contexte, qui joue les notes écrites. Un échec après paiement garde son coût (voir lecture.py)."""
+    import lecture
+    arguments = (video_id, chemin_brut(video_id), dossier_media("lectures"))
     try:
-        plan = analyse.analyser(brut, video_id)
-        cout = plan["cout_usd"]
-        gardes, rejetes = tri.trier(plan["moments"])
-        plan["moments"], plan["rejetes"] = gardes, plan.get("rejetes", []) + rejetes
-        taches.ecrire_json(chemin_plan(video_id), plan)
+        return lecture.contexte(*arguments) if remarque else lecture.analyser(*arguments)
     except Exception as e:
-        noter_cout(getattr(e, "cout_usd", cout))
+        noter_cout(getattr(e, "cout_usd", 0))
         raise
-    return plan
 
 
 def chemin_cout_tache(id_tache):
@@ -302,8 +285,9 @@ def recuperer_video(video_id):
 
 def monter_moment(video_id, n):
     if not os.path.isfile(chemin_plan(video_id)):
-        raise FileNotFoundError(f"plan absent pour {video_id} : /analyse d'abord")
-    moment = next((m for m in lire_plan(video_id)["moments"] if m.get("n") == n), None)
+        raise FileNotFoundError(f"plan absent pour {video_id} : /analyse ne l'écrit plus, le montage revient au lot 2")
+    with open(chemin_plan(video_id), encoding="utf-8") as fichier:
+        moment = next((m for m in json.load(fichier)["moments"] if m.get("n") == n), None)
     if moment is None:
         raise ValueError(f"moment {n} absent du plan de {video_id}")
     nom = f"{video_id}_{n}.mp4"
@@ -322,7 +306,9 @@ def etat_tache(id_tache):
     etat = taches.lire(id_tache)
     if etat is None:
         return jsonify({"error": "Unknown task"}), 404
-    if etat["etat"] == "echouee" and os.path.isfile(chemin_cout_tache(id_tache)):
+    if etat["etat"] == "reussie":  # n8n ne lit qu'un champ, à la racine, réussie ou échouée
+        etat = {**etat, "cout_usd": etat["resultat"].get("cout_usd", 0)}
+    elif etat["etat"] == "echouee" and os.path.isfile(chemin_cout_tache(id_tache)):
         with open(chemin_cout_tache(id_tache), encoding="utf-8") as fichier:
             etat = {**etat, **json.load(fichier)}
     return jsonify(etat), 200
@@ -341,7 +327,30 @@ def lancer_analyse():
     video_id = video_id_recu()
     if video_id is None:
         return jsonify({"error": "Invalid video_id"}), 400
-    return jsonify({"tache": taches.lancer(lambda: analyser_video(video_id), video_id)}), 202
+    return jsonify({"tache": taches.lancer(lambda: lire_video(video_id), video_id)}), 202
+
+
+@app.route('/contexte', methods=['POST'])
+def lancer_contexte():
+    video_id = video_id_recu()
+    if video_id is None:
+        return jsonify({"error": "Invalid video_id"}), 400
+    note = request.get_json().get('note')
+    if not isinstance(note, str) or not note.strip():
+        return jsonify({"error": "note must be a non-empty string"}), 400
+    import lecture
+    if lecture.mettre_en_attente(video_id, note.strip(), dossier_media("lectures")):
+        return jsonify({"en_attente": True}), 200
+    return jsonify({"tache": taches.lancer(lambda: lire_video(video_id, remarque=True), video_id)}), 202
+
+
+@app.route('/lectures/<video_id>', methods=['GET'])
+def lire_lecture(video_id):
+    if not MOTIF_VIDEO.fullmatch(video_id):
+        return jsonify({"error": "Invalid video_id"}), 400
+    import lecture
+    lue = lecture.lire(video_id, dossier_media("lectures"))
+    return (jsonify(lue), 200) if lue is not None else (jsonify({"error": "Lecture not found"}), 404)
 
 
 @app.route('/monter', methods=['POST'])

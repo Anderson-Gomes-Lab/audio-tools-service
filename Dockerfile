@@ -12,8 +12,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# On copie le code de notre application, sa consigne et sa police
+# On copie le code de notre application, ses consignes, ses fiches et sa police
 COPY *.py consigne.md ./
+COPY lecture/ lecture/
 COPY polices/ polices/
 
 # On expose le port sur lequel notre service va écouter
