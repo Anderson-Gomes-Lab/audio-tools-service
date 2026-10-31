@@ -37,7 +37,6 @@ def video(chemin, *options):
 def media(tmp_path_factory):
     dossier = tmp_path_factory.mktemp("media")
     video(dossier / "clip.mp4", "-f", "lavfi", "-i", "sine=frequency=440:duration=4", "-shortest")
-    video(dossier / "muet.mp4")
     return dossier
 
 
