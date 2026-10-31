@@ -29,7 +29,7 @@ Un seul processus : le verrou des tâches et leur état en mémoire tiennent dan
 `API_TOKEN` (routes de clips, sans lui tout est refusé), `APIFY_TOKEN`, `GEMINI_API_KEY`, `MEDIA_DIR` (facultative, `/media` par défaut), `PLAFOND_GEMINI_MOIS_USD` (facultative : sans elle, le compteur du mois compte sans bloquer).
 
 ## Mesures (31/10/2026)
-Complexité max 15 (ruff C901), tenue. Fichiers ≤ 400 lignes ; le plus gros, `app.py`, en fait 398 : la route `/vertical`, que la chaîne n'appelle pas, est à retirer avant toute nouvelle route.
+Complexité max 15 (ruff C901), tenue. Fichiers ≤ 400 lignes ; le plus gros, `app.py`, en fait 400 : la route `/vertical`, que la chaîne n'appelle pas, est à retirer avant toute nouvelle route.
 Mesure de l'écran sur 30 min : 116 s sur Mac, environ 220 Mo, à refaire sur le VPS.
 Rendu d'un Short de 30 s depuis un AV1 1080p : environ 16 s sur le Mac de développement, à remesurer sur le VPS. Coupe exacte à l'image près, -14,5 LUFS.
 AV1 : le ffmpeg de Debian (bookworm et trixie) est construit avec `--enable-libdav1d` (vérifié dans `debian/rules`) ; image Docker non construite, pas de Docker sur le poste.
