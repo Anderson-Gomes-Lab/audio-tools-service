@@ -1,4 +1,5 @@
 import json
+import os
 import shutil
 import sys
 import threading
@@ -22,6 +23,18 @@ def poser_brut(media, modele):
     shutil.copy(modele, media / "bruts" / f"{ID}.mp4")
 
 
+def poser_lecture(media, contenu):
+    (media / "lectures").mkdir(exist_ok=True)
+    (media / "lectures" / f"{ID}.json").write_text(json.dumps(contenu))
+
+
+def lire_json(chemin):
+    if not os.path.isfile(chemin):
+        return None
+    with open(chemin, encoding="utf-8") as fichier:
+        return json.load(fichier)
+
+
 def poser_plan(media, contenu=None):
     (media / "plans").mkdir(exist_ok=True)
     (media / "plans" / f"{ID}.json").write_text(json.dumps(contenu or plan()))
@@ -38,16 +51,28 @@ def api(atelier, auth):
 
 @pytest.fixture
 def ia(monkeypatch):
-    """Faux analyse.py et tri.py : compte les appels."""
+    """Faux lecture.py : compte les appels."""
     appels = []
 
-    def analyser(chemin, video_id):
-        appels.append((chemin, video_id))
-        return {**plan([{"n": 1}, {"n": 2}]), "rejetes": [{"n": 9}]}
+    def analyser(video_id, brut, dossier):
+        appels.append(("analyser", video_id, brut, dossier))
+        return {"video_id": video_id, "cout_usd": 1.5}
 
-    monkeypatch.setitem(sys.modules, "analyse", types.SimpleNamespace(analyser=analyser))
-    monkeypatch.setitem(sys.modules, "tri", types.SimpleNamespace(trier=lambda m: (m[:1], m[1:])))
-    return appels
+    def contexte(video_id, brut, dossier):
+        appels.append(("contexte", video_id))
+        return {"video_id": video_id, "cout_usd": 0.2}
+
+    faux = types.SimpleNamespace(analyser=analyser, contexte=contexte, attente=[])
+
+    def mettre_en_attente(video_id, note, dossier):
+        faux.attente.append(note)
+        return not os.path.isfile(os.path.join(dossier, f"{video_id}.json"))
+
+    faux.mettre_en_attente = mettre_en_attente
+    faux.lire = lambda video_id, dossier: lire_json(os.path.join(dossier, f"{video_id}.json"))
+    monkeypatch.setitem(sys.modules, "lecture", faux)
+    faux.appels = appels
+    return faux
 
 
 def test_sante(atelier, auth):
@@ -61,9 +86,9 @@ def test_tache_inconnue(atelier, auth):
 
 
 @pytest.mark.parametrize("mauvais", ["court", "a" * 12, "a" * 10 + "/", "../../etc/p", "a" * 11 + "\n", 12, None])
-@pytest.mark.parametrize("route", ["/fetch", "/analyse", "/monter", "/nettoyer"])
+@pytest.mark.parametrize("route", ["/fetch", "/analyse", "/contexte", "/monter", "/nettoyer"])
 def test_video_id_refuse(api, route, mauvais):
-    assert api(route, {"video_id": mauvais, "moment": 1}).status_code == 400
+    assert api(route, {"video_id": mauvais, "moment": 1, "note": "n"}).status_code == 400
 
 
 def test_corps_absent_refuse(atelier, auth):
@@ -82,26 +107,54 @@ def test_fetch_lance_une_tache(api, attendre, monkeypatch, atelier):
     assert attendre(reponse.get_json()["tache"])["resultat"] == {"file_path": f"bruts/{ID}.mp4"}
 
 
-def test_analyse_ecrit_le_plan_trie(api, attendre, ia, tmp_path, brut_modele):
-    poser_brut(tmp_path, brut_modele)
+def test_analyse_passe_par_la_lecture(api, attendre, ia, tmp_path):
     etat = attendre(api("/analyse", {"video_id": ID}).get_json()["tache"])
-    assert etat["etat"] == "reussie"
-    assert etat["resultat"]["moments"] == [{"n": 1}]
-    assert etat["resultat"]["rejetes"] == [{"n": 9}, {"n": 2}]
-    assert etat["resultat"]["cout_usd"] == 0.18
-    assert json.loads((tmp_path / "plans" / f"{ID}.json").read_text()) == etat["resultat"]
+    assert etat["resultat"] == {"video_id": ID, "cout_usd": 1.5}
+    assert ia.appels == [("analyser", ID, str(tmp_path / "bruts" / f"{ID}.mp4"), str(tmp_path / "lectures"))]
 
 
-def test_analyse_ne_repaie_pas(api, attendre, ia, tmp_path):
-    poser_plan(tmp_path)
+def test_analyse_n_ecrit_plus_de_plan(api, attendre, ia, tmp_path):
+    attendre(api("/analyse", {"video_id": ID}).get_json()["tache"])
+    assert not (tmp_path / "plans").exists()
+
+
+def test_cout_d_une_lecture_echouee_gardee(api, attendre, ia, monkeypatch):
+    def rate(video_id, brut, dossier):
+        erreur = RuntimeError("panne")
+        erreur.cout_usd = 0.42
+        raise erreur
+    monkeypatch.setattr(ia, "analyser", rate)
     etat = attendre(api("/analyse", {"video_id": ID}).get_json()["tache"])
-    assert etat["resultat"]["moments"][0]["n"] == 3
-    assert ia == []
+    assert (etat["etat"], etat["cout_usd"]) == ("echouee", 0.42)
 
 
-def test_analyse_sans_brut_echoue(api, attendre, ia):
-    assert attendre(api("/analyse", {"video_id": ID}).get_json()["tache"])["etat"] == "echouee"
-    assert ia == []
+@pytest.mark.parametrize("note", [None, "", "   ", 12])
+def test_contexte_refuse_une_note_vide(api, ia, note):
+    assert api("/contexte", {"video_id": ID, "note": note}).status_code == 400
+    assert ia.attente == [] and ia.appels == []
+
+
+def test_contexte_avant_la_lecture_attend(api, ia):
+    reponse = api("/contexte", {"video_id": ID, "note": "  le cri  "})
+    assert (reponse.status_code, reponse.get_json()) == (200, {"en_attente": True})
+    assert ia.attente == ["le cri"] and ia.appels == []
+
+
+def test_contexte_apres_la_lecture_lance_une_tache(api, attendre, ia, tmp_path):
+    poser_lecture(tmp_path, {"video_id": ID})
+    reponse = api("/contexte", {"video_id": ID, "note": "le cri"})
+    assert reponse.status_code == 202
+    assert attendre(reponse.get_json()["tache"])["resultat"]["cout_usd"] == 0.2
+    assert ia.attente == ["le cri"] and ia.appels == [("contexte", ID)]  # la note est sur le disque avant la tâche
+
+
+def test_lire_une_lecture(atelier, auth, ia, tmp_path):
+    client = atelier.app.test_client()
+    assert client.get(f"/lectures/{ID}", headers=auth).status_code == 404
+    poser_lecture(tmp_path, {"video_id": ID, "resume": "r"})
+    assert client.get(f"/lectures/{ID}", headers=auth).get_json() == {"video_id": ID, "resume": "r"}
+    assert client.get(f"/lectures/{ID}").status_code == 401
+    assert client.get("/lectures/pas%20bon", headers=auth).status_code == 400
 
 
 def test_monter_cherche_le_moment_par_son_numero(api, attendre, tmp_path, brut_modele):
@@ -110,6 +163,7 @@ def test_monter_cherche_le_moment_par_son_numero(api, attendre, tmp_path, brut_m
     etat = attendre(api("/monter", {"video_id": ID, "moment": 3}).get_json()["tache"])
     assert etat["etat"] == "reussie", etat
     assert etat["resultat"]["file_path"] == f"shorts/{ID}_3.mp4"
+    assert etat["cout_usd"] == 0  # une tâche gratuite annonce 0, sans cas particulier
     assert abs(etat["resultat"]["duree_s"] - 3) < 0.2
     assert etat["resultat"]["rendu_s"] > 0
     assert (tmp_path / "shorts" / f"{ID}_3.mp4").is_file()
@@ -125,7 +179,8 @@ def test_monter_moment_absent(api, attendre, tmp_path, brut_modele):
 
 def test_monter_sans_plan(api, attendre, tmp_path, brut_modele):
     poser_brut(tmp_path, brut_modele)
-    assert attendre(api("/monter", {"video_id": ID, "moment": 1}).get_json()["tache"])["etat"] == "echouee"
+    etat = attendre(api("/monter", {"video_id": ID, "moment": 1}).get_json()["tache"])
+    assert etat["etat"] == "echouee" and "plan absent" in etat["erreur"] and "lot 2" in etat["erreur"]
 
 
 def test_short_se_telecharge_avec_le_jeton(atelier, auth, tmp_path):
@@ -156,10 +211,21 @@ def test_nettoyer_efface_tout_et_rien_que_ca(api, tmp_path):
     assert api("/nettoyer", {"video_id": ID}).get_json() == {"efface_mo": 0}
 
 
+def test_nettoyer_garde_lecture_note_fichier_et_compteur(api, tmp_path):
+    (tmp_path / "lectures").mkdir()
+    fins = ("json", "note.txt", "fichier.json", "mesures.json", "releve.json")
+    gardes = [tmp_path / "lectures" / f"{ID}.{fin}" for fin in fins]
+    gardes.append(tmp_path / "compteur-gemini.json")
+    for chemin in gardes:
+        chemin.write_text("{}")
+    api("/nettoyer", {"video_id": ID})
+    assert all(chemin.is_file() for chemin in gardes)
+
+
 @pytest.mark.parametrize("etat", ["en_cours", "en_attente"])
 def test_nettoyer_refuse_pendant_une_tache_sur_la_video(api, attendre, monkeypatch, tmp_path, etat):
     libre = threading.Event()
-    monkeypatch.setattr(fetch, "recuperer", lambda video_id, dossier: libre.wait(5))
+    monkeypatch.setattr(fetch, "recuperer", lambda video_id, dossier: {"fini": libre.wait(5)})
     premiere = api("/fetch", {"video_id": ID if etat == "en_cours" else "autrevideo1"}).get_json()["tache"]
     while taches.lire(premiere)["etat"] != "en_cours":
         threading.Event().wait(0.01)

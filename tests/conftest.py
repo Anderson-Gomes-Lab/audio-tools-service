@@ -1,14 +1,28 @@
 import importlib
 import subprocess
 import time
+from datetime import date
+from types import SimpleNamespace
 
 import pytest
 import requests
 
+import analyse
+
+JOUR_ESSAI = date(2026, 11, 1)  # tarif réduit : un test qui dépend du tarif ne casse pas au 1er janvier 2027
 ID_VIDEO = "mcKcHx3qbFQ"
 LIEN_APIFY = "https://apify.dziura.online/te/x.mp4?sig=SECRET"
 ELEMENT_FACTURE = "apify-default-dataset-item"
 JETON_APIFY = "apify_api_jeton_de_test"
+
+
+def poser_jour(monkeypatch, jour):
+    monkeypatch.setattr(analyse, "date", SimpleNamespace(today=lambda: jour))
+
+
+@pytest.fixture(autouse=True)
+def jour_fige(monkeypatch):
+    poser_jour(monkeypatch, JOUR_ESSAI)
 
 
 def video(chemin, *options):

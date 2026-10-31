@@ -6,28 +6,20 @@ from types import SimpleNamespace
 import pytest
 
 import analyse
+from conftest import poser_jour
 import montage
 
 PLAN_EXEMPLE = json.loads((Path(__file__).parent.parent / "contrat" / "plan-exemple.json").read_text(encoding="utf-8"))
 CLE = "AIzaCLEDETEST123"
 ID = "abcdefghijk"
 USAGE = SimpleNamespace(prompt_token_count=1_000_000, candidates_token_count=100_000, thoughts_token_count=100_000)
-VRAIE_DUREE = analyse._duree
+FICHIER = SimpleNamespace(name="files/x", uri="u", mime_type="video/mp4")
 
 
 def moment(debut, fin, registre="maitrise", score=8, **autres):
     return {"debut_s": debut, "pic_s": fin - 1, "fin_s": fin, "registre": registre, "format": "instant",
             "score": score, "monstre": "Rathalos", "arme": "Long Sword", "textes": [], "preuve": "vu", "autre": None,
             **autres}
-
-
-def mmss(secondes):
-    return f"{int(secondes // 60):02d}:{int(secondes % 60):02d}"
-
-
-def passe_1(*moments):
-    ecrits = [{**m, "debut": mmss(m["debut_s"]), "pic": mmss(m["pic_s"]), "fin": mmss(m["fin_s"])} for m in moments]
-    return {"titre_propose": "t", "description_proposee": "d", "moments": ecrits}
 
 
 def passe_2(debut=98.0, fin=110.0, trouve=True):
@@ -38,32 +30,14 @@ def passe_2(debut=98.0, fin=110.0, trouve=True):
 class FauxGemini:
     """Remplace genai.Client : réponses en file, appels notés."""
 
-    def __init__(self, reponses, envoi_echoue=False, etats=("ACTIVE",), suivi_echoue=False):
+    def __init__(self, reponses):
         self.reponses = list(reponses)
-        self.envoi_echoue = envoi_echoue
-        self.suivi_echoue = suivi_echoue
-        self.etats = list(etats)
         self.appels = []
-        self.effaces = []
-        self.files = SimpleNamespace(upload=self._upload, get=self._get, delete=self._delete)
+        self.files = SimpleNamespace(get=self._get)
         self.models = SimpleNamespace(generate_content=self._generer)
 
-    def _fichier(self):
-        etat = self.etats.pop(0)
-        return SimpleNamespace(name="files/x", uri="u", mime_type="video/mp4", state=SimpleNamespace(name=etat))
-
-    def _upload(self, file, config):
-        if self.envoi_echoue:
-            raise RuntimeError(f"échec https://x.googleapis.com/v1?key={CLE} clé {CLE}")
-        return self._fichier()
-
     def _get(self, name):
-        if self.suivi_echoue:
-            raise RuntimeError("panne du suivi")
-        return self._fichier()
-
-    def _delete(self, name):
-        self.effaces.append(name)
+        raise RuntimeError("panne du suivi")
 
     def _generer(self, model, contents, config):
         self.appels.append(contents[0].video_metadata)
@@ -75,62 +49,57 @@ class FauxGemini:
 
 
 @pytest.fixture
-def gemini(monkeypatch):
+def gemini(monkeypatch, tmp_path):
     monkeypatch.setenv("GEMINI_API_KEY", CLE)
-    monkeypatch.setattr(analyse, "_duree", lambda chemin: 600.0)
-    monkeypatch.setattr(analyse, "PAUSE_FICHIER_S", 0)
+    monkeypatch.setenv("MEDIA_DIR", str(tmp_path))
+    monkeypatch.delenv("PLAFOND_GEMINI_MOIS_USD", raising=False)
 
-    def installer(*reponses, **options):
-        faux = FauxGemini(reponses, **options)
-        monkeypatch.setattr(analyse.genai, "Client", lambda api_key: faux)
-        return faux
+    def installer(*reponses):
+        return FauxGemini(reponses)
     return installer
 
 
-def echec():
-    with pytest.raises(analyse.ErreurAnalyse) as erreur:
-        analyse.analyser("v.mp4", "abc")
-    return erreur.value
+def preciser(faux, *moments, duree=600.0, facture=None):
+    return analyse._preciser(faux, FICHIER, "consigne", list(moments), duree, facture or analyse._Facture())
 
 
-def test_plan_conforme_au_contrat(gemini):
-    faux = gemini(passe_1(moment(100, 110)), passe_2())
-    plan = analyse.analyser("v.mp4", "abc")
-    assert faux.effaces == ["files/x"]
-    assert set(plan) == set(PLAN_EXEMPLE)
-    assert set(plan["moments"][0]) == set(PLAN_EXEMPLE["moments"][0])
-    assert set(plan["moments"][0]["textes"][0]) == set(PLAN_EXEMPLE["moments"][0]["textes"][0])
-    assert plan["video_id"] == "abc"
-    assert plan["modele"] == PLAN_EXEMPLE["modele"]
+def precis(faux, *moments, duree=600.0):
+    return preciser(faux, *moments, duree=duree)[0][0]
+
+
+def test_moment_precise_conforme_au_plan(gemini):
+    m = analyse._conforme(precis(gemini(passe_2()), moment(100, 110, n=1)))
+    assert set(m) == set(PLAN_EXEMPLE["moments"][0])
+    assert set(m["textes"][0]) == set(PLAN_EXEMPLE["moments"][0]["textes"][0])
+    assert PLAN_EXEMPLE["modele"] == analyse.MODELE
 
 
 @pytest.mark.parametrize("debut, fin", [(98.0, 110.0), (18.0, 30.0)])  # depuis la vidéo, depuis l'extrait
 def test_bornes_de_la_passe_2_ramenees_a_la_video(gemini, debut, fin):
-    faux = gemini(passe_1(moment(100, 110)), passe_2(debut=debut, fin=fin))
-    m = analyse.analyser("v.mp4", "abc")["moments"][0]
+    faux = gemini(passe_2(debut=debut, fin=fin))
+    m = precis(faux, moment(100, 110))
     assert (m["debut_s"], m["fin_s"]) == (98.0, 110.0)
-    assert faux.appels[0].fps == analyse.FPS_PASSE_1
-    extrait = faux.appels[1]
+    extrait = faux.appels[0]
     assert (extrait.fps, extrait.start_offset, extrait.end_offset) == (analyse.FPS_PASSE_2, "80.0s", "130.0s")
 
 
 @pytest.mark.parametrize("reponse", [passe_2(debut=300.0, fin=310.0), passe_2(trouve=False)])
 def test_moment_absent_de_l_extrait_rejete(gemini, reponse):
-    gemini(passe_1(moment(100, 110)), reponse)
-    plan = analyse.analyser("v.mp4", "abc")
-    assert plan["moments"] == []
-    assert plan["rejetes"][0]["raison"] == "passe 2"
+    gardes, ecartes = preciser(gemini(reponse), moment(100, 110))
+    assert gardes == []
+    assert ecartes[0]["raison"] == "passe 2"
 
 
 def test_extrait_borne_par_la_video(gemini):
-    faux = gemini(passe_1(moment(5, 15)), passe_2(debut=2.0, fin=12.0))
-    analyse.analyser("v.mp4", "abc")
-    assert faux.appels[1].start_offset == "0.0s"
+    faux = gemini(passe_2(debut=2.0, fin=12.0))
+    preciser(faux, moment(5, 15))
+    assert faux.appels[0].start_offset == "0.0s"
 
 
 def test_cout_additionne_les_appels_reels(gemini):  # chacun : 1 M entrée à 0,75 $ + 200 k sortie à 3,75 $ = 1,50 $
-    gemini(passe_1(moment(100, 110)), passe_2())
-    assert analyse.analyser("v.mp4", "abc")["cout_usd"] == pytest.approx(3.0)
+    facture = analyse._Facture()
+    preciser(gemini(passe_2(), passe_2(200.0, 210.0)), moment(100, 110), moment(200, 210), facture=facture)
+    assert facture.usd == pytest.approx(3.0)
 
 
 def test_tarif_change_apres_le_31_decembre():
@@ -138,70 +107,69 @@ def test_tarif_change_apres_le_31_decembre():
     assert analyse._cout(USAGE, date(2027, 1, 1)) == pytest.approx(3.0)
 
 
+@pytest.mark.parametrize("jour", [date(2026, 11, 1), date(2027, 6, 1)])
+def test_tarif_de_flash_lite(jour):  # 1 M à 0,30 $ + 200 k à 2,50 $
+    assert analyse._cout(USAGE, jour, analyse.MODELE_IDENTIFICATION) == pytest.approx(0.8)
+
+
+def test_facture_compte_chaque_modele_a_son_tarif(gemini, monkeypatch):
+    poser_jour(monkeypatch, date(2026, 11, 1))
+    facture = analyse._Facture()
+    facture.noter(USAGE, analyse.MODELE_IDENTIFICATION)
+    facture.noter(USAGE, analyse.MODELE)
+    assert facture.usd == pytest.approx(2.3)
+
+
 def test_json_mal_forme_relance_puis_reussit(gemini):
-    faux = gemini("pas du json", "{toujours pas", passe_1())
-    plan = analyse.analyser("v.mp4", "abc")
+    faux = gemini("pas du json", "{toujours pas", passe_2())
+    facture = analyse._Facture()
+    assert preciser(faux, moment(100, 110), facture=facture)[0]
     assert len(faux.appels) == 3
-    assert plan["moments"] == []
-    assert plan["cout_usd"] == pytest.approx(4.5)
+    assert facture.usd == pytest.approx(4.5)
 
 
 @pytest.mark.parametrize("reponses", [("a", "b", "c"), ("[]", "{}", "null")])
 def test_abandon_apres_deux_relances(gemini, reponses):
     faux = gemini(*reponses, "jamais lu")
-    echec()
+    with pytest.raises(analyse.ErreurAnalyse, match="mal formé"):
+        preciser(faux, moment(100, 110))
     assert len(faux.appels) == 3
-    assert faux.effaces == ["files/x"]
-
-
-def test_erreur_sans_cle_ni_url(gemini):
-    gemini(envoi_echoue=True)
-    erreur = echec()
-    assert CLE not in str(erreur)
-    assert "googleapis" not in str(erreur)
-    assert erreur.__cause__ is None and erreur.__suppress_context__
 
 
 def test_cle_absente(monkeypatch):
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    echec()
+    with pytest.raises(analyse.ErreurAnalyse, match="GEMINI_API_KEY absente"):
+        analyse.client()
 
 
-@pytest.mark.parametrize("options, delai", [
-    ({"etats": ("PROCESSING", "FAILED")}, 900),
-    ({"etats": ("PROCESSING", "PROCESSING")}, -1),
-    ({"etats": ("PROCESSING",), "suivi_echoue": True}, 900),
+@pytest.mark.parametrize("etats, delai, attendu", [
+    (("FAILED",), 900, "traiter la vidéo"),
+    (("PROCESSING",), -1, "à temps"),
 ])
-def test_traitement_distant_echoue(gemini, monkeypatch, options, delai):
-    faux = gemini(**options)
+def test_traitement_distant_echoue(monkeypatch, etats, delai, attendu):
     monkeypatch.setattr(analyse, "ATTENTE_FICHIER_S", delai)
-    echec()
-    assert faux.effaces == ["files/x"]
+    faux = gemini_sans_reponse()
+    fichier = SimpleNamespace(name="files/x", state=SimpleNamespace(name=etats[0]))
+    with pytest.raises(analyse.ErreurAnalyse, match=attendu):
+        analyse.attendre_traitement(faux, fichier)
+
+
+def test_suivi_du_traitement_en_panne_remonte(monkeypatch):
+    monkeypatch.setattr(analyse, "PAUSE_FICHIER_S", 0)
+    fichier = SimpleNamespace(name="files/x", state=SimpleNamespace(name="PROCESSING"))
+    with pytest.raises(RuntimeError, match="panne du suivi"):
+        analyse.attendre_traitement(gemini_sans_reponse(), fichier)
+
+
+def gemini_sans_reponse():
+    return FauxGemini(())
 
 
 @pytest.mark.parametrize("texte, attendu", [
     ("04:05", 245), ("29:44", 1784), ("120:00", 7200), ("405", -1), ("4:75", -1),
 ])
 def test_secondes(texte, attendu):
-    assert analyse._secondes(texte) == attendu
-
-
-@pytest.mark.parametrize("brut", [
-    {**passe_1(moment(100, 110)), "moments": [{**passe_1(moment(100, 110))["moments"][0], "debut": "cent"}]},
-    passe_1(moment(700, 710)),
-])
-def test_moment_hors_video_rejete_sans_passe_2(gemini, brut):
-    faux = gemini(brut)
-    plan = analyse.analyser("v.mp4", "abc")
-    assert plan["moments"] == [] and plan["rejetes"][0]["raison"] == "hors vidéo"
-    assert len(faux.appels) == 1
-
-
-def test_pas_de_passe_2_pour_un_score_faible(gemini):
-    faux = gemini(passe_1(moment(100, 110, score=3)))
-    plan = analyse.analyser("v.mp4", "abc")
-    assert len(faux.appels) == 1
-    assert plan["rejetes"][0]["raison"] == "score"
+    assert analyse.secondes(texte) == attendu
 
 
 def test_analyse_n_importe_pas_flask():
@@ -213,8 +181,7 @@ def ecrit(debut, fin, mot="parry diff"):
 
 
 def plan_avec(gemini, textes, debut=98.0, fin=110.0, registre="maitrise"):
-    gemini(passe_1(moment(100, max(110, int(fin)), registre)), {**passe_2(debut, fin), "textes": textes})
-    return analyse.analyser("v.mp4", "abc")["moments"]
+    return preciser(gemini({**passe_2(debut, fin), "textes": textes}), moment(100, max(110, int(fin)), registre))[0]
 
 
 @pytest.mark.parametrize("recus, attendus", [
@@ -245,41 +212,28 @@ def test_duree_par_registre_et_format(gemini, registre, rendu, fin, debut, forma
 
 
 def test_raccourcir_ne_coupe_jamais_le_pic(gemini):
-    gemini(passe_1(moment(100, 200, "rire")), {**passe_2(100.0, 200.0), "pic_s": 110.0})
-    plan = analyse.analyser("v.mp4", "abc")
-    assert plan["moments"] == [] and plan["rejetes"][0]["raison"] == "passe 2"
+    gardes, ecartes = preciser(gemini({**passe_2(100.0, 200.0), "pic_s": 110.0}), moment(100, 200, "rire"))
+    assert gardes == [] and ecartes[0]["raison"] == "passe 2"
 
 
 def test_la_fin_laisse_retomber_l_action(gemini):
-    gemini(passe_1(moment(100, 120, "spectacle")), {**passe_2(100.0, 120.0), "pic_s": 119.5})
-    m = analyse.analyser("v.mp4", "abc")["moments"][0]
+    m = precis(gemini({**passe_2(100.0, 120.0), "pic_s": 119.5}), moment(100, 120, "spectacle"))
     assert m["fin_s"] == 122.5 and m["debut_s"] == 100.0
 
 
 def test_une_fin_plus_tardive_que_le_minimum_est_gardee(gemini):
-    gemini(passe_1(moment(100, 120, "spectacle")), {**passe_2(100.0, 128.0), "pic_s": 120.0})
-    assert analyse.analyser("v.mp4", "abc")["moments"][0]["fin_s"] == 128.0
+    assert precis(gemini({**passe_2(100.0, 128.0), "pic_s": 120.0}), moment(100, 120, "spectacle"))["fin_s"] == 128.0
 
 
-def test_la_fin_s_arrete_a_la_fin_de_la_video(gemini, monkeypatch):
-    gemini(passe_1(moment(100, 118, "spectacle")), {**passe_2(100.0, 118.0), "pic_s": 117.5})
-    monkeypatch.setattr(analyse, "_duree", lambda chemin: 119.0)
-    assert analyse.analyser("v.mp4", "abc")["moments"][0]["fin_s"] == 119.0
+def test_la_fin_s_arrete_a_la_fin_de_la_video(gemini):
+    m = precis(gemini({**passe_2(100.0, 118.0), "pic_s": 117.5}), moment(100, 118, "spectacle"), duree=119.0)
+    assert m["fin_s"] == 119.0
 
 
 def test_rallonger_la_fin_garde_le_debut_et_l_accroche(gemini):
-    gemini(passe_1(moment(100, 130, "detente")),
-           {**passe_2(100.0, 130.0), "pic_s": 129.5, "textes": [ecrit(0.5, 3.0)]})
-    m = analyse.analyser("v.mp4", "abc")["moments"][0]
+    faux = gemini({**passe_2(100.0, 130.0), "pic_s": 129.5, "textes": [ecrit(0.5, 3.0)]})
+    m = precis(faux, moment(100, 130, "detente"))
     assert (m["debut_s"], m["fin_s"]) == (100.0, 132.5) and m["textes"] == [ecrit(0.5, 3.0)]
-
-
-def test_l_analyse_applique_le_quota(gemini):
-    faux = gemini(passe_1(moment(100, 120), moment(200, 220), moment(300, 320)),
-                  passe_2(100.0, 120.0), passe_2(200.0, 220.0))
-    plan = analyse.analyser("v.mp4", "abc")
-    assert [m["n"] for m in plan["moments"]] == [1, 2]
-    assert [r["raison"] for r in plan["rejetes"]] == ["quota"] and len(faux.appels) == 3
 
 
 def test_recadrer_garde_l_instant_reel_des_textes(gemini):
@@ -296,102 +250,95 @@ def test_consignes_et_plafonds():
         assert f"| {registre} | {instant[0]}–{instant[1]} s | {sequence[0]}–{sequence[1]} s |" in passe_b
 
 
-ECRIT = passe_1(moment(1, 9))["moments"][0]
-
-
-@pytest.mark.parametrize("mauvais", [
-    "[]", "null", "{}", {**passe_1(), "moments": "aucun"}, {**passe_1(), "moments": [{"debut": "00:01"}]},
-    {**passe_1(), "moments": [{**ECRIT, "debut": None}]}, {**passe_1(), "moments": [{**ECRIT, "registre": "autre"}]},
-    {**passe_1(), "moments": [{**ECRIT, "score": "8"}]},
-])
-def test_forme_invalide_en_passe_1_relance(gemini, mauvais):
-    faux = gemini(mauvais, passe_1())
-    assert analyse.analyser("v.mp4", "abc")["moments"] == []
-    assert len(faux.appels) == 2
-
-
 @pytest.mark.parametrize("mauvais", [
     {"trouve": True}, {**passe_2(), "x_centre": "milieu"}, {**passe_2(), "textes": None},
     {**passe_2(), "textes": [{"texte": "x"}]}, {**passe_2(), "trouve": "oui"}, {**passe_2(), "debut_s": True},
 ])
 def test_forme_invalide_en_passe_2_relance(gemini, mauvais):
-    faux = gemini(passe_1(moment(100, 110)), mauvais, passe_2())
-    assert len(analyse.analyser("v.mp4", "abc")["moments"]) == 1
-    assert len(faux.appels) == 3
+    faux = gemini(mauvais, passe_2())
+    assert len(preciser(faux, moment(100, 110))[0]) == 1
+    assert len(faux.appels) == 2
 
 
 @pytest.mark.parametrize("reponses, cout", [
     (("a", "b", "c"), 4.5),
-    ((passe_1(moment(100, 110)), "a", "b", "c"), 6.0),
-    ((passe_1(moment(100, 110)), RuntimeError("panne")), 1.5),
     (("a", RuntimeError("panne")), 1.5),
     ((RuntimeError("panne"),), 0),
 ])
-def test_erreur_porte_tout_le_cout_paye(gemini, reponses, cout):
-    faux = gemini(*reponses)
-    assert echec().cout_usd == pytest.approx(cout)
-    assert faux.effaces == ["files/x"]
+def test_erreur_laisse_tout_le_cout_paye_sur_la_facture(gemini, reponses, cout):
+    facture = analyse._Facture()
+    with pytest.raises(Exception), analyse.facturation(facture):
+        preciser(gemini(*reponses), moment(100, 110), facture=facture)
+    assert facture.usd == pytest.approx(cout)
 
 
-def test_arrondi_de_fin_de_video_tolere_et_borne(gemini, monkeypatch):
-    gemini(passe_1(moment(108, 120)), passe_2(debut=108.0, fin=120.0))
-    monkeypatch.setattr(analyse, "_duree", lambda chemin: 119.96)
-    m = analyse.analyser("v.mp4", "abc")["moments"][0]
+def test_facturation_porte_le_cout_sur_l_erreur():
+    facture = analyse._Facture()
+    facture.usd = 1.2345678
+    with pytest.raises(analyse.ErreurAnalyse) as erreur, analyse.facturation(facture):
+        raise RuntimeError("panne")
+    assert erreur.value.cout_usd == 1.234568 and "RuntimeError: panne" in str(erreur.value)
+
+
+def test_arrondi_de_fin_de_video_tolere_et_borne(gemini):
+    m = precis(gemini(passe_2(debut=108.0, fin=120.0)), moment(108, 120), duree=119.96)
     assert (m["debut_s"], m["fin_s"]) == (108.0, 119.96)
-    gemini(passe_1(moment(108, 120)))  # au-delà de la tolérance
-    monkeypatch.setattr(analyse, "_duree", lambda chemin: 118.9)
-    assert analyse.analyser("v.mp4", "abc")["rejetes"][0]["raison"] == "hors vidéo"
+    assert preciser(gemini(passe_2(debut=108.0, fin=120.0)), moment(108, 120), duree=118.9)[0] == []
 
 
-def test_duree_passe_par_le_montage(monkeypatch):
-    monkeypatch.setattr(montage, "duree_video", lambda chemin: 42.0)
-    assert analyse._duree("v.mp4") == 42.0
+def test_facture_sans_limite_ne_refuse_jamais(gemini):
+    facture = analyse._Facture()
+    facture.usd = 1000.0
+    facture.verifier()
 
 
-def test_erreur_masque_les_autres_secrets(gemini, monkeypatch):
-    monkeypatch.setenv("API_TOKEN", "jeton-tres-secret")
-    gemini(RuntimeError("refus jeton-tres-secret"))
-    message = str(echec())
-    assert "jeton-tres-secret" not in message and "RuntimeError" in message
+@pytest.mark.parametrize("jour, limite", [(date(2026, 12, 31), 3.0), (date(2027, 1, 1), 6.0)])
+def test_limite_de_la_facture_vaut_dix_centimes_la_minute(gemini, monkeypatch, jour, limite):
+    poser_jour(monkeypatch, jour)
+    facture = analyse._Facture(1800)
+    facture.usd = limite - 0.01
+    facture.verifier()
+    facture.usd = limite
+    with pytest.raises(analyse.ErreurAnalyse, match=rf"{limite:.0f},00 \$"):
+        facture.verifier()
 
 
-@pytest.fixture
-def service(atelier, auth, attendre, gemini, monkeypatch, tmp_path, brut_modele):
-    """Le vrai service : seule l'API Gemini est simulée."""
-    monkeypatch.setattr(analyse, "_duree", VRAIE_DUREE)
-    (tmp_path / "bruts").mkdir()
-    (tmp_path / "bruts" / f"{ID}.mp4").write_bytes(brut_modele.read_bytes())
-    client = atelier.app.test_client()
-
-    def tache(route, **corps):
-        return attendre(client.post(route, json={"video_id": ID, **corps}, headers=auth).get_json()["tache"])
-    return tache
+def test_compteur_repart_de_zero_le_mois_suivant(gemini, tmp_path):
+    (tmp_path / "compteur-gemini.json").write_text(json.dumps({"mois": "2020-01", "usd": 999.0}))
+    facture = analyse._Facture()
+    facture.verifier()
+    facture.noter(USAGE)
+    lu = json.loads((tmp_path / "compteur-gemini.json").read_text())
+    assert lu == {"mois": analyse.date.today().strftime("%Y-%m"), "usd": pytest.approx(facture.usd)}
 
 
-def test_branchement_app_analyse_tri_montage(service, gemini, tmp_path):
-    gemini(passe_1(moment(1, 2, "rire", 3), moment(2, 10)), passe_2(debut=2.0, fin=10.0))
-    plan = service("/analyse")["resultat"]
-    assert [(m["n"], m["debut_s"], m["fin_s"]) for m in plan["moments"]] == [(1, 0.0, 10.0)]
-    assert [r["raison"] for r in plan["rejetes"]] == ["score"]
-    assert json.loads((tmp_path / "plans" / f"{ID}.json").read_text(encoding="utf-8")) == plan
-    assert service("/monter", moment=1)["etat"] == "reussie"
+@pytest.mark.parametrize("plafond", [None, ""])  # variable absente, ou laissée vide dans Coolify
+def test_sans_plafond_defini_le_compteur_compte_sans_bloquer(gemini, tmp_path, monkeypatch, plafond):
+    if plafond is not None:
+        monkeypatch.setenv("PLAFOND_GEMINI_MOIS_USD", plafond)
+    mois = analyse.date.today().strftime("%Y-%m")
+    (tmp_path / "compteur-gemini.json").write_text(json.dumps({"mois": mois, "usd": 5000.0}))
+    facture = analyse._Facture()
+    facture.verifier()
+    facture.noter(USAGE)
+    assert json.loads((tmp_path / "compteur-gemini.json").read_text())["usd"] == pytest.approx(5000.0 + facture.usd)
 
 
-def test_cout_d_un_echec_remonte_et_ne_se_recompte_pas(service, gemini, atelier, auth, attendre):
-    gemini("a", "b", "c")
-    rate = service("/analyse")
-    assert (rate["etat"], rate["cout_usd"]) == ("echouee", pytest.approx(4.5))
-    atelier.taches._etats.clear()
-    assert atelier.app.test_client().get(f"/taches/{rate['id']}", headers=auth).get_json()["cout_usd"] == 4.5
+def test_plafond_defini_bloque(gemini, tmp_path, monkeypatch):
+    monkeypatch.setenv("PLAFOND_GEMINI_MOIS_USD", "25")
+    mois = analyse.date.today().strftime("%Y-%m")
+    (tmp_path / "compteur-gemini.json").write_text(json.dumps({"mois": mois, "usd": 24.99}))
+    facture = analyse._Facture()
+    facture.verifier()
+    (tmp_path / "compteur-gemini.json").write_text(json.dumps({"mois": mois, "usd": 25.0}))
+    with pytest.raises(analyse.ErreurAnalyse, match=r"25,00 \$"):
+        facture.verifier()
 
-    gemini(passe_1())
-    assert service("/analyse")["resultat"]["cout_usd"] == pytest.approx(1.5)
-    faux = gemini()
-    assert service("/analyse")["resultat"]["cout_usd"] == pytest.approx(1.5)
+
+def test_passe_2_respecte_les_gardes(gemini):
+    facture = analyse._Facture(60)
+    facture.usd = 0.5
+    faux = gemini(passe_2())
+    with pytest.raises(analyse.ErreurAnalyse):
+        preciser(faux, moment(100, 110), facture=facture)
     assert faux.appels == []
-
-
-def test_plan_non_ecrit_garde_le_cout(service, gemini, atelier, monkeypatch):
-    monkeypatch.setattr(atelier, "chemin_plan", lambda video_id: "/dev/null/plans/x.json")
-    gemini(passe_1())
-    assert service("/analyse")["cout_usd"] == pytest.approx(1.5)
